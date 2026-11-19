@@ -11,17 +11,48 @@ view can change what the user reads, never what the model does.
 
 from __future__ import annotations
 
+import sys
 import time
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from rich.console import Console
+from rich.markup import escape
 
 from . import images
 
 SLOW_MIRROR_CYCLE_S = 30.0
 """An empty mirror cycle longer than this gets a line in the terminal. The ordinary
 empty cycle runs every twenty seconds all session and rightly says nothing."""
+
+
+def desk_step_line(event: dict[str, Any]) -> str:
+    """One line for one CAD desk step, as every text view prints it.
+
+    `event` is `cad.agent.Step.as_event()` -- the same dict the transcript holds, so
+    a person reading the study's log later and a person watching the terminal read
+    the same words. A review step names its round and verdict; a cell step its
+    number, its exit and the desk's own sentence about it, falling back to the first
+    line of code when the desk said nothing.
+    """
+    kind = str(event.get("kind") or "cell")
+    number = int(event.get("step") or 0)
+    seconds = float(event.get("seconds") or 0.0)
+    text = " ".join(str(event.get("text") or "").split())
+    if kind == "review":
+        head = f"cad review {number}" if number else "cad review"
+        first = text.splitlines()[0] if text else ""
+        return f"{head} · {seconds:.0f}s · {first[:220]}"
+    head = f"cad desk step {number}" if number else "cad desk"
+    exit_code = event.get("exit_code")
+    state = "ok" if exit_code == 0 else f"exit {exit_code}"
+    seen = " · picture" if event.get("image") else ""
+    return f"{head} · {seconds:.0f}s · {state}{seen} · {text[:220]}"
+
+
+def _desk_step_blocks(event: dict[str, Any]) -> bool:
+    """A review that handed work back, which is the one desk line worth colour."""
+    return str(event.get("kind") or "") == "review" and event.get("exit_code") not in (0, None)
 
 
 @runtime_checkable
@@ -67,11 +98,35 @@ class View(Protocol):
         tool calls, and a turn that took three rounds looks like one that took
         thirty. Facts only: which round, how long, how many calls."""
 
+    def working(self, what: str) -> None:
+        """The session is busy on the agent's behalf before any model output exists --
+        choosing the solver, for one (`Loop._route`). It is the agent's move, not the
+        person's: a view that shows whose turn it is shows the agent's, with `what` as
+        its stage. Not a draft -- nothing is streaming. The default is the stage line."""
+        self.stage(what)
+
     def interjection(self, text: str) -> None:
         """Something the user said that will reach the model without stopping it."""
 
     def workspace(self, browser: Any) -> None:
-        """A read-only way to look at the workspace, for views that can show one."""
+        """A read-only way to look at the workspace, for views that can show one.
+
+        Handed over as soon as the session knows where it is looking, which may be
+        before the workspace itself is up: a listing asked of the browser then waits
+        for it. A view that lists on its own thread need not care; one that would
+        block its screen can wait for `workspace_ready` first."""
+
+    def workspace_ready(self, instance_id: str, seconds: float) -> None:
+        """The workspace is up and set up, so the tools can run. Said once per
+        session, `seconds` after the session began asking for it; the header has
+        long since named the instance, so a view showing "starting" stops."""
+
+    def workspace_failed(self, reason: str) -> None:
+        """The workspace will not come: its start was refused or failed, or it came up
+        and could not be set up. Said in place of `workspace_ready`, beside the notice
+        that says why, so a view showing "starting" stops counting (#48 on the web
+        app: a refused start read "workspace starting" for ten minutes). A start sent
+        again later -- a ceiling raised -- ends in `workspace_ready` as usual."""
 
     def show_files(self, path: str = "", depth: int = 0) -> None:
         """Show what is in the workspace. Answered locally; the model is not told."""
@@ -98,18 +153,70 @@ class View(Protocol):
         something to show -- a job, a slow tool, a sync -- hidden otherwise."""
 
     def narration(self, text: str) -> None:
-        """One plain-language line on what the agent is doing right now, from the
-        front desk. This is the 'what is happening' line, distinct from the model's
-        own reasoning peek."""
+        """One plain-language line on what the agent is doing right now, said when it
+        changes. Built by the tracker from what it already knows -- the job running,
+        the tool in flight (`progress.Tracker.now_line`) -- with no model call and no
+        clock in it, so it changes when the work does. Distinct from the model's own
+        reasoning peek."""
 
-    def desk(self, text: str) -> None:
-        """The front desk answering the user while the main agent is mid-turn.
-        Shown as speech, clearly attributed to the desk and not the agent."""
+    def side_question(self, text: str) -> None:
+        """The person asked a side question (`/btw <question>`); its answer is coming.
+        Not a message to the agent and not part of the conversation: a view shows it
+        apart, beside the answer that follows."""
+
+    def side_answer(self, text: str, forwarded: bool) -> None:
+        """The side chat's answer to the last side question (`desk.SideChat`): words
+        only, never added to the conversation. `forwarded` says the person's words were
+        also passed on to the agent, which reads them at its next step.
+
+        Shown apart from the transcript. The default is the old front desk's speech
+        where a view still has it -- the hosted page's did, before side questions --
+        so the answer is shown there as the desk's replies were; else an info line."""
+        desk = getattr(self, "desk", None)
+        if desk is not None:
+            desk(text)
+        else:
+            self.info(text)
+
+    def received(self, text: str) -> None:
+        """A message typed while the agent is mid-turn has been queued for it: the
+        receipt, said at once (`cli._receipt`) -- the agent reads it at its next step,
+        what it is doing now and for how long, and `/btw` for a question that does not
+        wait. The default is an info line."""
+        self.info(text)
+
+    def desk_step(self, event: dict[str, Any]) -> None:
+        """One step of the CAD desk's work, or the reviewer's verdict on it, as the
+        transcript records it (`cad.agent.Step.as_event`). Shown in the conversation,
+        not only on the status line: the desk holds the session for minutes and the
+        person watching is owed a line per step, the same as a tool call gets. A view
+        that follows the transcript file (the web app) may leave this empty -- the
+        row is already in the store by the time this is called."""
 
     def delivered(self, event: Any) -> None:
         """The mirror surfaced new renders (and maybe assembled a gif). Announce
         them and, where a view can, show or offer to open them. The agent is not
         involved -- this is the harness delivering what it already has."""
+
+    def model(self, model: str, effort: str, provider: str) -> None:
+        """The model, effort or provider changed mid-session (`/model`, `/effort`).
+        A view that shows them in a header refreshes it."""
+
+    def approval(self, request_id: str, kind: str, title: str, detail: str, choices: list[str]) -> None:
+        """A question for the person, because they chose to be consulted (`modes.py`).
+        `kind` is job, checkpoint or ceiling. The answer arrives as a typed line; the view
+        only has to make the question impossible to miss."""
+
+    def approval_done(self, request_id: str, outcome: str, note: str = "") -> None:
+        """The question `request_id` was answered: approved, declined or approved_all."""
+
+    def mode(self, mode: str) -> None:
+        """The session's mode, at the start and whenever the person switches it."""
+
+    def solver(self, solver: str) -> None:
+        """The study's solver, `openfoam` or `felix`: at the start when it is known,
+        else the moment it is chosen from the person's first message, before the
+        agent's first turn (`desk.route`). Said once; it does not change."""
 
 
 MAX_LISTED = 300
@@ -119,18 +226,50 @@ PROGRESS_REPEAT_S = 30.0
 hold one, so the line is printed; every second would be a scroll of nothing."""
 """A scrolling terminal cannot show more than this usefully; the pane can."""
 
+PIPED_WIDTH = 160
+"""How wide a console is when nothing is there to measure.
+
+`rich` falls back to eighty columns when stdout is not a terminal, and eighty columns
+folds a workspace path, a solver command or a residual line in the middle of a token --
+so a piped run was harder to read than the terminal it was copied from, and harder
+still to grep. Nothing is watching a pipe's width, so pick one wide enough for the
+lines this actually prints."""
+
+
+def plain_console(file: Any = None) -> Console:
+    """A console that does not fold its output when nobody is looking at a terminal.
+
+    Width alone was not enough: a wider console still folds a line longer than itself,
+    and a workspace path under a CI runner's temp directory is longer than 160 columns,
+    so "3 frames" reached the reader as "3\\nframes". `soft_wrap` stops rich inserting
+    newlines at all, which is what a pipe or an agent reading the output wants.
+
+    `Console.is_terminal` is not the check: on Windows, rich can report a StringIO
+    as a terminal and still fold at eighty columns. Ask the file itself."""
+    target = sys.stdout if file is None else file
+    if getattr(target, "isatty", lambda: False)():
+        return Console(file=file)
+    return Console(
+        file=file, width=PIPED_WIDTH, soft_wrap=True, force_terminal=False
+    )
+
 
 class ConsoleView(View):
     """The plain streaming terminal."""
 
+    surface = "plain"
+    """What `/help` is answered for (`cli._local`): the terminal's commands, without the
+    interface's completion and keys, which a line reader does not have."""
+
     def __init__(self, console: Console | None = None):
-        self.console = console or Console()
+        self.console = console or plain_console()
         self._thinking = False
         self._browser: Any = None
         self._watching: list[str] = []
         self._progress_key: tuple = ()
         self._progress_at = 0.0
         self._narration = ""
+        self._jobs: list[tuple] = []
 
     def header(self, study_id: str, instance_id: str, model: str, mirror: Path) -> None:
         self.console.print(
@@ -174,6 +313,43 @@ class ConsoleView(View):
     def usage(self, tokens: int, fraction: float) -> None:
         """The plain view has nowhere to keep this, so it stays quiet."""
 
+    def jobs(self, records: list[Any]) -> None:
+        """Say what changed about the jobs, whenever it changes.
+
+        This view inherited the protocol's empty body for its whole life, so it was a
+        silent no-op: every job state change reached the interface and the hosted web
+        app and nothing at all reached a plain or piped terminal. A four-hour solve
+        finishing is the one thing a run wants to be told, and `-p` -- the mode with
+        nobody watching -- was the mode that dropped it.
+
+        Only the changes are printed. The tools report the whole job table on every
+        state change, and reprinting eight unchanged rows each time is how a terminal
+        fills up with nothing.
+        """
+        current = [
+            (
+                str(getattr(r, "job_id", "") or ""),
+                getattr(r, "name", None),
+                getattr(r, "status", ""),
+                getattr(r, "exit_code", None),
+                getattr(r, "end_reason", None),
+            )
+            for r in records
+        ]
+        was = dict((row[0], row) for row in self._jobs)
+        self._jobs = current
+        for job_id, name, status, exit_code, end_reason in current:
+            if was.get(job_id) == (job_id, name, status, exit_code, end_reason):
+                continue
+            label = name or job_id[:8]
+            detail = ""
+            if exit_code is not None:
+                detail = f" (exit {exit_code})"
+            elif end_reason:
+                detail = f" ({end_reason})"
+            style = "green" if status == "running" else "dim"
+            self.console.print(f"[{style}]job {label}: {status}{detail}[/]")
+
     def stage(self, text: str) -> None:
         """No pane to hold one line, so it becomes another line.
 
@@ -204,6 +380,12 @@ class ConsoleView(View):
 
     def workspace(self, browser: Any) -> None:
         self._browser = browser
+
+    def workspace_ready(self, instance_id: str, seconds: float) -> None:
+        """One dim line, and only when there was a wait worth naming: a workspace
+        that was up before the session asked says nothing."""
+        if seconds >= 1.0:
+            self.console.print(f"[dim]workspace ready after {seconds:.0f} s[/]")
 
     def show_files(self, path: str = "", depth: int = 0) -> None:
         if self._browser is None:
@@ -248,7 +430,10 @@ class ConsoleView(View):
             self.console.print(f"[dim]newest: {pics[0]}[/]")
 
     def status(self, lines: list[str]) -> None:
+        # Escaped: `/help` prints argument forms like `[path]`, which rich would
+        # otherwise swallow as markup tags.
         for index, line in enumerate(lines):
+            line = escape(line)
             self.console.print(f"[cyan]{line}[/]" if index == 0 else f"[dim]{line}[/]")
 
     def mirrored(self, report: Any) -> None:
@@ -305,8 +490,57 @@ class ConsoleView(View):
             self._narration = text
             self.console.print(f"[dim italic]  - {text}[/]", highlight=False)
 
-    def desk(self, text: str) -> None:
-        self.console.print(f"\n[bold cyan]desk[/] [cyan]{text}[/]", highlight=False)
+    def side_question(self, text: str) -> None:
+        self.console.print(f"\n[bold cyan]btw[/] [cyan]{escape(text)}[/]  "
+                           "[dim](a side question: answered apart, the agent carries on)[/]",
+                           highlight=False)
+
+    def side_answer(self, text: str, forwarded: bool) -> None:
+        self.console.print(f"[bold cyan]side[/] [cyan]{escape(text)}[/]", highlight=False)
+        if forwarded:
+            self.console.print("[dim]  (passed on to the agent in your words; it reads "
+                               "them at its next step)[/]", highlight=False)
+
+    def received(self, text: str) -> None:
+        self.console.print(f"[dim]  {escape(text)}[/]", highlight=False)
+
+    def desk_step(self, event: dict[str, Any]) -> None:
+        """One line per step of the CAD desk's work, in the conversation, dim: the
+        reviewer's verdict in the same place and brighter when it hands work back."""
+        self.console.print(f"  {escape(desk_step_line(event))}",
+                           style="yellow" if _desk_step_blocks(event) else "dim",
+                           highlight=False)
+
+    def model(self, model: str, effort: str, provider: str) -> None:
+        self.console.print(f"[bold]model[/] {model}   [bold]effort[/] {effort}   "
+                           f"[bold]provider[/] {provider}")
+
+    def approval(self, request_id: str, kind: str, title: str, detail: str, choices: list[str]) -> None:
+        """Boxed, so a question waiting on the person does not scroll past as one more
+        line of tool output."""
+        rule = "-" * 60
+        self.console.print(f"\n[bold yellow]{rule}[/]", highlight=False)
+        self.console.print(f"[bold yellow]{escape(title)}[/]", highlight=False)
+        for line in (detail or "").splitlines():
+            self.console.print(f"  {line}", highlight=False, markup=False)
+        answer = "y approve / n decline (or say why) / a approve all"
+        if kind == "checkpoint":
+            answer = "y approve / n or say what to change / a approve all"
+        elif kind == "ceiling":
+            answer = "y continue / n stop the study"
+        self.console.print(f"[yellow]{answer}[/]", highlight=False)
+        self.console.print(f"[bold yellow]{rule}[/]", highlight=False)
+
+    def approval_done(self, request_id: str, outcome: str, note: str = "") -> None:
+        said = {"approved": "approved", "declined": "declined",
+                "approved_all": "approved, and full auto from here on"}.get(outcome, outcome)
+        self.console.print(f"[yellow]{escape(said + (f': {note}' if note else ''))}[/]",
+                           highlight=False)
+
+    def mode(self, mode: str) -> None:
+        from .modes import label
+
+        self.console.print(f"[dim]mode: {label(mode)}[/]")
 
     def delivered(self, event: Any) -> None:
         """Say what arrived and, on a graphics terminal, draw it. Elsewhere the path

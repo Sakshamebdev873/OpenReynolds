@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import zlib
+
 import httpx2 as httpx
 import pytest
 
@@ -228,23 +230,73 @@ def _edge_with_a_150s_redirect(result: dict) -> httpx.MockTransport:
     return httpx.MockTransport(handler)
 
 
-def _client_against(transport: httpx.MockTransport, *, follow_redirects: bool) -> FoamdClient:
+def _client_against(transport: httpx.MockTransport) -> FoamdClient:
+    """A client wired to a stub transport and otherwise built exactly as the real one.
+
+    `follow_redirects=False` is not a test setting: it is what `FoamdClient.__init__`
+    does, and it is what makes httpx hand each redirect back as `next_request` for
+    `_send_following_safe_redirects` to decide about. Building the stub any other way
+    would test httpx's redirect policy instead of this module's."""
     client = FoamdClient("https://svc.example", "of_live_test")
     client._client = httpx.Client(
         base_url="https://svc.example",
         transport=transport,
-        follow_redirects=follow_redirects,
+        follow_redirects=False,
     )
     return client
 
 
-def test_an_unfollowed_redirect_is_named_not_a_json_decode_failure():
-    """The whole bug, as the model saw it: `bad_response (303): the body was empty`.
-    True, and useless -- it named the symptom and hid the one thing to act on."""
+def test_closing_the_client_closes_the_pool_and_nothing_else():
+    """`FoamdClient.close` once called `self.kernel_stop()`, a method only `KernelHost`
+    has. Every hosted session's close-down raised `AttributeError` there, so the
+    session was recorded as `error` and its workspace left running for the reaper
+    (2026-09-22 to 09-24, found while testing ui #35). The client owns one thing --
+    the HTTP pool -- and closing it must be exactly that."""
+    client = FoamdClient("https://svc.example", "of_live_test")
+    client.close()  # must not raise
+    assert client._client.is_closed
+
+
+def test_the_backend_puts_the_kernel_down_and_then_closes_its_client():
+    """The kernel is the backend's, not the client's: `HostedBackend.close` stops it
+    first and closes the transport second, and the client is asked for nothing it
+    does not have."""
     from openreynolds.backend.hosted import HostedBackend
 
-    client = _client_against(_edge_with_a_150s_redirect({}), follow_redirects=False)
+    order: list[str] = []
+    client = _client_against(httpx.MockTransport(lambda request: httpx.Response(200, json={})))
     backend = HostedBackend(client, "inst-1")
+
+    class Channel:
+        def stop(self):
+            order.append("kernel_stop")
+
+    backend._channel = Channel()
+    real_close = client.close
+
+    def closing():
+        order.append("client_close")
+        real_close()
+
+    client.close = closing
+    backend.close()
+
+    assert order == ["kernel_stop", "client_close"]
+    assert client._client.is_closed
+
+
+def test_a_redirect_with_nowhere_to_go_is_named_not_a_json_decode_failure():
+    """The whole of F-45, as the model saw it: `bad_response (303): the body was empty`.
+    True, and useless -- it named the symptom and hid the one thing to act on.
+
+    A 303 carrying no `Location` is the one redirect nothing can follow, so it is the
+    case that still has to be named rather than followed."""
+    from openreynolds.backend.hosted import HostedBackend
+
+    def handler(request):
+        return httpx.Response(303, content=b"")
+
+    backend = HostedBackend(_client_against(httpx.MockTransport(handler)), "inst-1")
 
     with pytest.raises(BackendError) as excinfo:
         backend.exec("sleep 200", timeout_s=250)
@@ -253,24 +305,384 @@ def test_an_unfollowed_redirect_is_named_not_a_json_decode_failure():
         "not bad_response -- the JSON decoder must not be where this lands"
     )
     assert excinfo.value.status == 303
-    assert "follow_redirects" in excinfo.value.message
-    assert "/v1/exec-result" in excinfo.value.message
+    assert "no Location" in excinfo.value.message
 
 
 def test_a_long_exec_completes_through_the_redirect():
     """A 250 s exec is under `EXEC_MAX_TIMEOUT_S` and over the edge's window. Followed,
-    the redirect carries the real result: measured live, `sleep 200` returns rc=0."""
+    the redirect carries the real result: measured live, `sleep 200` returns rc=0.
+
+    This is F-45, and narrowing the redirect policy for F-47 must not cost it. The exec
+    POST carries a body, so it is precisely the case a blanket "never follow a redirect
+    on a request with a body" rule would break."""
     from openreynolds.backend.hosted import HostedBackend
 
     transport = _edge_with_a_150s_redirect(
         {"exit_code": 0, "output": "done", "truncated": False}
     )
-    backend = HostedBackend(_client_against(transport, follow_redirects=True), "inst-1")
+    backend = HostedBackend(_client_against(transport), "inst-1")
 
     result = backend.exec("sleep 200", timeout_s=250)
 
     assert result.exit_code == 0
     assert result.output == "done"
+
+
+# -- a command the service moved to a job ---------------------------------------------
+#
+# `POST .../exec` answers one of four shapes (`OpenFoam_Instance/app/execs.py`), and the
+# second -- the caller asked for longer than the service holds a connection, the command
+# was still running at the 120 s window, so it was started again from scratch as a
+# detached job -- is `{exit_code: null, promoted: true, job_id, output, stderr, note}`.
+# Until 2026-09-21 this client turned it into `ExecResult(exit_code=0, output=note,
+# job_id=...)`, and `tools._bash` printed the zero first: `bash sleep 240`, `sleep 200`
+# and `sleep 180` (study 20260921-033019-e1b4, jobs 808edf10 / 5432459d / e839ac57) each
+# read to the model as a command that had finished with no output.
+
+
+def _service_answering(body: dict) -> httpx.MockTransport:
+    return httpx.MockTransport(lambda request: httpx.Response(200, json=body))
+
+
+PROMOTED = {
+    "exit_code": None, "output": "", "truncated": False, "log_path": "", "stderr": "",
+    "promoted": True, "job_id": "808edf10-0957-482f-a105-2151008d3a86",
+    "note": ("no exit code came back within the 120s synchronous limit, and you asked "
+             "for 300s, so the command was re-launched from the start as a detached job "
+             "(808edf10-0957-482f-a105-2151008d3a86). Follow it with job_check: nothing "
+             "in THIS answer reports a failure, because it carries no exit code to fail "
+             "on (`exit_code` is null here -- the command belongs to the job now)."),
+}
+"""The service's answer, as `execs.py` builds it and `spec/openapi.yaml` describes it."""
+
+
+def test_a_promoted_exec_carries_no_exit_code_and_says_it_is_a_job():
+    """What the service said, carried as it said it: no exit code, the flag, the job.
+    Never `exit_code=0` -- that is the one number every reader takes for "finished,
+    and it worked", and it was read exactly that way three times in one study."""
+    from openreynolds.backend.hosted import HostedBackend
+
+    backend = HostedBackend(_client_against(_service_answering(PROMOTED)), "inst-1")
+
+    result = backend.exec("sleep 240", timeout_s=300)
+
+    assert result.exit_code is None
+    assert result.promoted is True
+    assert result.job_id == "808edf10-0957-482f-a105-2151008d3a86"
+    assert result.output == "", "the service sends none of the first run's output"
+    assert result.stderr == ""
+    assert not result.idle and not result.truncated and result.log_path is None
+
+
+def test_a_promoted_exec_carries_the_wrappers_stderr_and_the_first_runs_output_through():
+    """`stderr` is the one field that tells a command still running at the window from
+    an exec that never got one started, and the service carries it on this shape for
+    that reason; `output` is whatever the synchronous run had printed. Neither is
+    dropped on the floor here."""
+    from openreynolds.backend.hosted import HostedBackend
+
+    said = {**PROMOTED, "stderr": "bash: /work/.foamd/exec: No such file or directory",
+            "output": "starting\n"}
+    backend = HostedBackend(_client_against(_service_answering(said)), "inst-1")
+
+    result = backend.exec("echo starting; sleep 240", timeout_s=300)
+
+    assert result.promoted and result.exit_code is None
+    assert result.stderr == "bash: /work/.foamd/exec: No such file or directory"
+    assert result.output == "starting\n"
+
+
+def test_a_promotion_collected_through_the_edges_redirect_is_read_as_one():
+    """The promoted answer can arrive through the same 303 an ordinary long exec does
+    (`_edge_with_a_150s_redirect`); the hop must not change what it says."""
+    from openreynolds.backend.hosted import HostedBackend
+
+    backend = HostedBackend(_client_against(_edge_with_a_150s_redirect(PROMOTED)), "inst-1")
+
+    result = backend.exec("sleep 240", timeout_s=300)
+
+    assert result.promoted and result.exit_code is None
+    assert result.job_id == PROMOTED["job_id"]
+
+
+def test_an_ordinary_answer_and_an_idle_poll_are_untouched_by_the_promoted_shape():
+    """The other three shapes read as they did: a finished command keeps its exit code,
+    its truncation and its log path, and a `background` poll that found nothing running
+    is `idle` -- neither is `promoted`, and neither has a job."""
+    from openreynolds.backend.hosted import HostedBackend
+
+    finished = {"exit_code": 3, "output": "boom", "truncated": True,
+                "log_path": "/work/.foamd/exec/abc.log", "stderr": ""}
+    backend = HostedBackend(_client_against(_service_answering(finished)), "inst-1")
+    result = backend.exec("false", timeout_s=300)
+    assert (result.exit_code, result.output, result.truncated, result.log_path) == (
+        3, "boom", True, "/work/.foamd/exec/abc.log")
+    assert not result.promoted and result.job_id == "" and not result.idle
+
+    idle = {"exit_code": None, "output": "", "truncated": False, "log_path": "",
+            "stderr": "nothing ran: no Sandbox is up", "nothing_ran": True, "idle": True}
+    backend = HostedBackend(_client_against(_service_answering(idle)), "inst-1")
+    result = backend.exec("find /work", timeout_s=60, background=True)
+    assert result.idle and result.exit_code == -1
+    assert not result.promoted and result.job_id == ""
+
+
+# -- and only the redirects that keep the request whole -------------------------------
+#
+# F-47's second hypothesis: httpx re-issues a 303 (and a 302, and a 301 on a POST) as a
+# GET with the body dropped, so the blanket `follow_redirects=True` that fixed F-45 made
+# every body-carrying request a body-losing one.
+#
+# Half of that hypothesis is dead and half is only unobserved. The 303 -- the one
+# redirect anything here has ever seen -- is what an origin answers after it has taken
+# the request, so the POST carrying the archive goes out whole and the hop only collects
+# the result: no body is lost. The 301/302 relocation is not disposed of by the service's
+# route table, the way an earlier draft of this comment said it was. A followed redirect
+# is re-issued at its `Location`, not at the path that was asked -- this file's own edge
+# stub sends `Location: /v1/exec-result` -- so `app/files.py` mounting the tar path
+# POST-only means a 405 for a GET aimed back at that path and says nothing at all about
+# a GET aimed anywhere else. No `Location` for a 3xx on that path has ever been captured.
+#
+# So what follows is not F-47's fix; it is a hazard closed on its own terms. For 303 the
+# behaviour is what `follow_redirects=True` already did, and 301/302 stop being able to
+# turn a write into a read without a word. Each hop is pinned.
+
+
+def _upload(client: FoamdClient, size: int = 64) -> None:
+    client.request(
+        "POST",
+        "/v1/instances/inst-1/tar",
+        params={"mode": "extract", "dest": "/work/c"},
+        content=b"x" * size,
+        headers={"Content-Type": "application/gzip"},
+        repeatable=True,
+    )
+
+
+def test_a_302_on_an_upload_is_refused_rather_than_re_sent_without_its_body():
+    """The body-losing event, refused where it used to be silent.
+
+    httpx turns a 302 on any method but HEAD into a GET and drops the stream, which for
+    an upload means the service is asked something other than what the caller asked and
+    answers about that instead. Whether that is what happened in F-47 is not settled
+    here: the GET goes to the redirect's `Location`, and no `Location` was ever captured
+    for the 3xx that preceded that 400. But a 302 is `the resource moved`, not `the
+    answer is over there`, so there is nothing to weigh: it is named, not followed."""
+    seen = []
+
+    def handler(request):
+        seen.append(request.method)
+        return httpx.Response(302, headers={"Location": "/v1/elsewhere"}, content=b"")
+
+    with pytest.raises(BackendError) as excinfo:
+        _upload(_client_against(httpx.MockTransport(handler)))
+
+    assert excinfo.value.code == "redirect_would_lose_the_body"
+    assert excinfo.value.status == 302
+    assert seen == ["POST"], "the bodyless GET must never be sent at all"
+
+
+def test_a_307_on_an_upload_is_replayed_whole():
+    """307 and 308 are the two redirects that preserve the method and the body, so
+    following them cannot lose anything -- httpx replays the same stream, and the
+    service sees the request that was made."""
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.read()))
+        if len(seen) == 1:
+            return httpx.Response(307, headers={"Location": "/v1/instances/inst-1/tar2"})
+        return httpx.Response(200, json={"extracted_to": "/work/c"})
+
+    _upload(_client_against(httpx.MockTransport(handler)))
+
+    assert [method for method, _ in seen] == ["POST", "POST"]
+    assert seen[0][1] == seen[1][1] == b"x" * 64, "the archive travelled on both legs"
+
+
+def test_a_redirect_on_a_read_is_followed_because_a_read_has_nothing_to_lose():
+    """The other half of the narrowing: a GET has no body, so httpx's downgrade to a
+    GET changes nothing about it. Every read this client makes keeps its redirects."""
+
+    def handler(request):
+        if request.url.path == "/v1/instances":
+            return httpx.Response(303, headers={"Location": "/v1/list-result"}, content=b"")
+        return httpx.Response(200, json=[{"id": "inst-1"}])
+
+    client = _client_against(httpx.MockTransport(handler))
+    assert client.list_instances() == [{"id": "inst-1"}]
+
+
+def test_an_answer_collected_through_a_303_is_returned_as_the_answer():
+    """The 303 is followed and its answer is the call's answer -- said out loud, because
+    it is the one place this module accepts a hop the body did not travel on.
+
+    The licence is what 303 means (RFC 9110 15.4.4): the origin has already received and
+    acted on the request, and the answer is at the other URI. So the POST's 179 bytes
+    going out on the first leg and 0 on the second is the status working, not a body
+    being lost -- and F-45 measured the reading, `sleep 200`'s own rc=0 coming back
+    through the hop at 203.9 s. If that reading is ever wrong for some route, this is
+    the test that will have to change, so the shape is pinned rather than assumed."""
+    legs = []
+
+    def handler(request):
+        legs.append((request.method, len(request.read())))
+        if request.method == "POST":
+            return httpx.Response(303, headers={"Location": "/v1/tar-result"}, content=b"")
+        return httpx.Response(200, json={"extracted_to": "/work/c"})
+
+    _upload(_client_against(httpx.MockTransport(handler)), size=179)
+
+    assert legs == [("POST", 179), ("GET", 0)], (
+        "one POST carrying the archive, one bodyless GET collecting the answer"
+    )
+
+
+def test_a_4xx_collected_through_a_303_is_the_services_own_answer(monkeypatch):
+    """A 400 that arrives over the hop is not retried and not relabelled.
+
+    An earlier draft of this fix made every 4xx behind a hop `ambiguous`, on the reading
+    that the service might never have got the body. That reading contradicts the one
+    that licenses following a 303 at all, and it cost real behaviour: a 401/403/413 was
+    retried like a transient. `not a valid tar.gz archive` here is the service's
+    sentence and the caller's to interpret -- `put_tree`, which is holding the bytes,
+    is the only place in this module that argues with it."""
+    monkeypatch.setattr(hosted_mod.time, "sleep", lambda _s: None)
+    posts = []
+
+    def handler(request):
+        if request.method == "POST":
+            posts.append(request.url.path)
+            return httpx.Response(303, headers={"Location": "/v1/tar-result"}, content=b"")
+        return httpx.Response(400, json={"error": "bad_request",
+                                         "message": "not a valid tar.gz archive"})
+
+    with pytest.raises(BackendError) as excinfo:
+        _upload(_client_against(httpx.MockTransport(handler)), size=1_324_532)
+
+    assert len(posts) == 1, "a 400 through a hop is still a 400; one upload, not five"
+    assert excinfo.value.message == "not a valid tar.gz archive"
+    assert excinfo.value.code == "bad_request"
+
+
+def test_a_429_through_a_303_still_backs_off_instead_of_raising_at_once(monkeypatch):
+    """The refinement that draft pre-empted, pinned so it cannot be pre-empted again.
+
+    429 is in `_DECLINED_STATUSES`: the service turned the call away without acting, so
+    even a non-repeatable exec may try again. Making a hop-collected 4xx `ambiguous`
+    made that exec raise `rate_limited` on the first answer -- a regression aimed
+    squarely at the long-exec path the 303 handling exists for."""
+    from openreynolds.backend.hosted import HostedBackend
+
+    monkeypatch.setattr(hosted_mod.time, "sleep", lambda _s: None)
+    execs = []
+
+    def handler(request):
+        if request.method == "POST":
+            execs.append(request.url.path)
+            return httpx.Response(303, headers={"Location": "/v1/exec-result"}, content=b"")
+        if len(execs) < 3:
+            return httpx.Response(429, json={"error": "rate_limited", "message": "slow down"})
+        return httpx.Response(200, json={"exit_code": 0, "output": "done",
+                                         "truncated": False})
+
+    backend = HostedBackend(_client_against(httpx.MockTransport(handler)), "inst-1")
+    result = backend.exec("sleep 200", timeout_s=250)
+
+    assert result.exit_code == 0
+    assert len(execs) == 3, "backed off twice and got there, rather than raising at once"
+
+
+def test_a_400_collected_through_a_303_hop_is_raised_on_the_first_answer():
+    """A hop earns a 4xx no special treatment, in either direction.
+
+    An exec is not repeatable -- the command is arbitrary and may already have moved
+    files, so a repeat is a second run, not a second look, the 13-minute command re-run
+    that `_REPEATABLE_METHODS` exists to prevent. But that is not what decides this one:
+    a 400 is not in `_RETRY_STATUSES` at all, so it is raised on the first answer whether
+    or not a hop was involved. (This test was named for a deleted branch that made a 4xx
+    behind a hop ambiguous; what it pins is the absence of that branch.)"""
+    from openreynolds.backend.hosted import HostedBackend
+
+    posts = []
+
+    def handler(request):
+        if request.method == "POST":
+            posts.append(request.url.path)
+            return httpx.Response(303, headers={"Location": "/v1/exec-result"}, content=b"")
+        return httpx.Response(400, json={"error": "bad_request", "message": "nope"})
+
+    backend = HostedBackend(_client_against(httpx.MockTransport(handler)), "inst-1")
+    with pytest.raises(BackendError) as excinfo:
+        backend.exec("sleep 200", timeout_s=250)
+
+    assert len(posts) == 1
+    assert excinfo.value.message == "nope"
+
+
+# -- the cap on how far a chain may run ----------------------------------------------
+#
+# Untested until F-47's review measured it wrong: the loop used to check `next_request`
+# only at the top, so a chain of exactly `_MAX_REDIRECTS` hops ending in a 200 made all
+# six requests, received the answer, and then raised `too_many_redirects` carrying
+# `status: 200` -- F-45's "the work succeeded and the client says it failed", back at the
+# bound. Both sides of the boundary are pinned here.
+
+
+def _a_chain_of(hops: int) -> httpx.MockTransport:
+    """`hops` redirects and then an answer. Each 307 so the body survives the hop and
+    the count is about the cap and nothing else."""
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        if len(seen) <= hops:
+            return httpx.Response(307, headers={"Location": f"/v1/hop-{len(seen)}"})
+        return httpx.Response(200, json={"extracted_to": "/work/c"})
+
+    return httpx.MockTransport(handler)
+
+
+def test_a_chain_that_ends_within_the_cap_returns_its_answer():
+    """Exactly `_MAX_REDIRECTS` hops are allowed, so the fifth hop's answer is an
+    answer. Off by one here means an exec that ran and succeeded is reported as a
+    failure, which is the whole cost of F-45 paid again at the bound."""
+    from openreynolds.backend.hosted import _MAX_REDIRECTS
+
+    _upload(_client_against(_a_chain_of(_MAX_REDIRECTS)))
+
+
+def test_a_chain_that_runs_past_the_cap_is_named_and_carries_a_redirect_status():
+    """One hop further is a loop this client will not chase. The error's `status` is the
+    redirect that was refused -- never the success code of an answer being thrown away,
+    which is what callers that branch on `.status` (`mirror.is_a_fact_about_the_path`)
+    would otherwise be handed on a failure."""
+    from openreynolds.backend.hosted import _MAX_REDIRECTS
+
+    with pytest.raises(BackendError) as excinfo:
+        _upload(_client_against(_a_chain_of(_MAX_REDIRECTS + 1)))
+
+    assert excinfo.value.code == "too_many_redirects"
+    assert excinfo.value.status == 307, "the redirect refused, not an answer discarded"
+    assert str(_MAX_REDIRECTS) in excinfo.value.message
+
+
+def test_an_ordinary_400_with_no_redirect_in_sight_is_still_not_retried():
+    """The guard on the change above: nothing here makes 400 retryable in general."""
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.path)
+        return httpx.Response(
+            400, json={"error": "bad_request", "message": "path escapes the /work jail"}
+        )
+
+    with pytest.raises(BackendError) as excinfo:
+        _upload(_client_against(httpx.MockTransport(handler)))
+
+    assert len(seen) == 1, "one attempt; a 400 that means it is a 400 that means it"
+    # `resolve_in_jail`'s own sentence (`app/files.py:200`), not an invented one.
+    assert excinfo.value.message == "path escapes the /work jail"
 
 
 def test_a_bare_redirect_reaching_the_decoder_is_named_there_too():
@@ -297,6 +709,245 @@ def test_the_signing_in_helpers_follow_redirects_too():
     transport = httpx.MockTransport(handler)
     assert auth_config("https://svc.example", transport=transport)["publishable_key"] == "pk"
     assert device_code("https://svc.example", transport=transport)["device_code"] == "dc"
+
+
+# -- the upload can check the claim being made about it -------------------------------
+#
+# F-47 as it actually arrived: `bad_request (400): not a valid tar.gz archive` for a
+# 1,324,532-byte archive `_tar_gz_of` had built seconds earlier, which opened cleanly on
+# the machine that sent it and uploaded cleanly on the next attempt -- one occurrence in
+# five. The service is describing bytes; `put_tree` is holding them; nobody has to guess.
+
+
+def _a_case(tmp_path):
+    case = tmp_path / "case"
+    case.mkdir()
+    (case / "geometry.json").write_text('{"kind": "wing"}', encoding="utf-8")
+    return case
+
+
+def test_an_upload_rejected_as_a_bad_archive_is_tried_once_more(monkeypatch, tmp_path):
+    """A 400 is the service saying the request was wrong, and `_RETRY_STATUSES` rightly
+    leaves it alone. This caller can do better than believe it: it built the archive, it
+    still has it, and if those bytes open then what reached the far end was not what was
+    sent. In the live occurrence the very next attempt worked."""
+    from openreynolds.backend.hosted import HostedBackend
+
+    monkeypatch.setattr(hosted_mod.time, "sleep", lambda _s: None)
+    client = FoamdClient("https://example.invalid", "of_live_test")
+    sent = []
+
+    def rejects_once(method, path, timeout=None, **kwargs):
+        sent.append(len(kwargs.get("content", b"")))
+        if len(sent) == 1:
+            return response(400, {"error": "bad_request",
+                                  "message": "not a valid tar.gz archive: gzip: stdin: "
+                                             "unexpected end of file"})
+        return response(200, {"extracted_to": "/work/case"})
+
+    monkeypatch.setattr(client._client, "request", rejects_once)
+    HostedBackend(client, "inst-1").put_tree(_a_case(tmp_path), "/work/case")
+
+    assert len(sent) == 2
+    assert sent[0] == sent[1] > 0, "the same archive, whole, both times"
+
+
+def test_an_upload_rejected_twice_names_the_transport_not_the_packing(monkeypatch, tmp_path):
+    """What the finding is really about: a message pointing at the wrong party. `not a
+    valid tar.gz archive` reads as a bad file, a wrong path or a packing bug, and every
+    one of those is expensive to rule out and was wrong. The service's own words are
+    kept -- and then contradicted, by the one machine in a position to contradict them."""
+    from openreynolds.backend.hosted import HostedBackend
+
+    monkeypatch.setattr(hosted_mod.time, "sleep", lambda _s: None)
+    client = FoamdClient("https://example.invalid", "of_live_test")
+    sent = []
+
+    def always_rejects(method, path, timeout=None, **kwargs):
+        sent.append(path)
+        return response(400, {"error": "bad_request", "message": "not a valid tar.gz archive"})
+
+    monkeypatch.setattr(client._client, "request", always_rejects)
+    with pytest.raises(BackendError) as excinfo:
+        HostedBackend(client, "inst-1").put_tree(_a_case(tmp_path), "/work/case")
+
+    assert len(sent) == 2, "tried twice, then said so -- not tried forever"
+    assert excinfo.value.code == "archive_did_not_arrive"
+    assert "not a valid tar.gz archive" in excinfo.value.message
+    assert "open here as a gzipped tar" in excinfo.value.message
+    assert "members" in excinfo.value.message, "the evidence, not just the assertion"
+
+
+def test_an_upload_refused_for_a_reason_that_is_not_the_archive_is_passed_through(
+    monkeypatch, tmp_path
+):
+    """A failure that is not about the bytes reaches the caller unchanged and on the
+    first answer -- a 404 has nothing to do with what the archive contains."""
+    from openreynolds.backend.hosted import HostedBackend
+
+    client = FoamdClient("https://example.invalid", "of_live_test")
+    sent = []
+
+    def gone(method, path, timeout=None, **kwargs):
+        sent.append(path)
+        return response(404, {"error": "not_found", "message": "instance not found"})
+
+    monkeypatch.setattr(client._client, "request", gone)
+    with pytest.raises(BackendError) as excinfo:
+        HostedBackend(client, "inst-1").put_tree(_a_case(tmp_path), "/work/case")
+
+    assert len(sent) == 1
+    assert excinfo.value.code == "not_found"
+
+
+@pytest.mark.parametrize("message", [
+    "tar member is a link (not allowed): 0/U",
+    "tar member is a special file (not allowed): dev/null",
+    "cannot parse tar listing entry: -rw-r--r-- garbage",
+    "cannot parse tar member size: -rw-r--r-- user/group x 2026-08-01 12:00 p",
+    "tar member escapes jail: ../etc/passwd",
+    "extract requires ?dest=",
+    "extraction failed: tar: write error",
+    "path escapes the /work jail",
+    "cannot resolve path: realpath: /work/c: Permission denied",
+])
+def test_a_400_about_what_the_archive_contains_is_believed_not_argued_with(
+    monkeypatch, tmp_path, message
+):
+    """The gate is the service's sentence, not the status.
+
+    Every message above is one `OpenFoam_Instance/app/files.py` really writes on the
+    `mode=extract` path -- the first five from `validate_tar_listing`, then the missing
+    `dest` and the failed unpack from the route itself, then the two `resolve_in_jail`
+    raises for the destination. Each is a true statement about an archive that arrived
+    perfectly intact. Gating on the status alone uploads 1.3 MB a second time to be told
+    the same thing, and then answers a correct service with "what arrived was not what
+    was sent" -- which is F-47's own defect, a message accusing the wrong party, with the
+    parties swapped. The link case is not hypothetical: `_tar_gz_of` uses
+    `tar.gettarinfo`, so a symlink in a case directory becomes a member the service
+    refuses by design.
+
+    Two sentences that stood in this list until now (`unpacked size exceeds the limit`,
+    `dest is outside /work`) are not strings `files.py` produces; the real ones are the
+    413 pinned in the test below and `path escapes the /work jail` above."""
+    from openreynolds.backend.hosted import HostedBackend
+
+    client = FoamdClient("https://example.invalid", "of_live_test")
+    sent = []
+
+    def refuses(method, path, timeout=None, **kwargs):
+        sent.append(path)
+        return response(400, {"error": "bad_request", "message": message})
+
+    monkeypatch.setattr(client._client, "request", refuses)
+    with pytest.raises(BackendError) as excinfo:
+        HostedBackend(client, "inst-1").put_tree(_a_case(tmp_path), "/work/case")
+
+    assert len(sent) == 1, "one upload -- the service is right and repeating proves it"
+    assert excinfo.value.code == "bad_request"
+    assert excinfo.value.message == message, "the service's words, whole and unargued"
+
+
+def test_an_archive_over_the_unpacked_cap_is_a_413_and_never_reaches_the_sentence_test(
+    monkeypatch, tmp_path
+):
+    """The one refusal about the archive's *contents* that is not a 400.
+
+    `validate_tar_listing` raises `payload_too_large` when the members sum past
+    `MAX_TAR_UNPACKED_MB` (`OpenFoam_Instance/app/files.py:380-381`), which is
+    `ApiError(413, "payload_too_large", "request body exceeds the N MB limit")` --
+    `app/errors.py:62-64`. So the `exc.status != 400` limb turns it away before
+    `_is_about_the_archives_bytes` is consulted: one upload, the service's own words,
+    and no argument. Pinned because both the comment in `put_tree` and the list above
+    used to call this a 400, and a re-upload of an archive that is genuinely too big is
+    exactly the wasted 1.3 MB the sentence gate exists to avoid."""
+    from openreynolds.backend.hosted import HostedBackend
+
+    client = FoamdClient("https://example.invalid", "of_live_test")
+    sent = []
+
+    def too_big(method, path, timeout=None, **kwargs):
+        sent.append(path)
+        return response(413, {"error": "payload_too_large",
+                              "message": "request body exceeds the 512 MB limit"})
+
+    monkeypatch.setattr(client._client, "request", too_big)
+    with pytest.raises(BackendError) as excinfo:
+        HostedBackend(client, "inst-1").put_tree(_a_case(tmp_path), "/work/case")
+
+    assert len(sent) == 1, "413 is not a 400 and is not retried by this gate"
+    assert excinfo.value.status == 413
+    assert excinfo.value.code == "payload_too_large"
+    assert excinfo.value.message == "request body exceeds the 512 MB limit"
+
+
+def test_the_archive_check_reads_the_services_own_wording():
+    """`_is_about_the_archives_bytes` is coupled to one sentence in `files.py`, which
+    appends `tar`'s stderr to it -- hence a prefix test. The coupling fails safe: if the
+    wording ever changes, the check stops firing and the service's error passes through
+    untouched, which is exactly where this started."""
+    from openreynolds.backend.hosted import _is_about_the_archives_bytes
+
+    assert _is_about_the_archives_bytes("not a valid tar.gz archive")
+    assert _is_about_the_archives_bytes(
+        "not a valid tar.gz archive: gzip: stdin: unexpected end of file")
+    assert not _is_about_the_archives_bytes("tar member is a link (not allowed): 0/U")
+
+
+def test_bytes_that_do_not_open_here_leave_the_services_verdict_standing(
+    monkeypatch, tmp_path
+):
+    """The contradiction is only earned when the evidence is in hand. If the archive
+    this client is holding does not open either, the service is agreeing with the
+    client and there is nothing to argue about -- one attempt, its words kept."""
+    from openreynolds.backend.hosted import HostedBackend
+
+    client = FoamdClient("https://example.invalid", "of_live_test")
+    monkeypatch.setattr(hosted_mod, "_tar_gz_of", lambda _d: b"not a gzip at all")
+    sent = []
+
+    def refuses(method, path, timeout=None, **kwargs):
+        sent.append(path)
+        return response(400, {"error": "bad_request",
+                              "message": "not a valid tar.gz archive"})
+
+    monkeypatch.setattr(client._client, "request", refuses)
+    with pytest.raises(BackendError) as excinfo:
+        HostedBackend(client, "inst-1").put_tree(_a_case(tmp_path), "/work/case")
+
+    assert len(sent) == 1
+    assert excinfo.value.code == "bad_request"
+
+
+def test_the_archive_check_answers_none_and_never_raises(monkeypatch):
+    """`_archive_opens_here` is called from inside an `except BackendError`, so anything
+    escaping it replaces the service's error with a traceback about the client's own
+    evidence-gathering -- the caller would lose the very message it was trying to
+    improve on.
+
+    `zlib.error` is in the catch and is not an `OSError`. It escapes `tarfile.open(...)`
+    + a member walk for real: three random byte flips in a good `w:gz` archive, 147 of
+    12,000 trials (six seeds x 2,000, one 30,436-byte archive, CPython 3.12.10). The
+    innermost frame was `gzip.py:554` every time; the `TarFile.next` statement above it
+    was `if not self.fileobj.read(1)` (`tarfile.py:2636`) on 130 and the
+    `self.fileobj.seek(self.offset - 1)` before it on 17 -- both outside the block
+    tarfile converts into `ReadError`.
+
+    That rate is a property of the fuzz, not of production: `put_tree` hands this
+    function an archive built moments earlier in the same process. And which byte flip
+    does it is not stable enough to pin in a test, so the escape is injected here and
+    the contract -- a description or `None`, never an exception -- is what is
+    asserted."""
+    from openreynolds.backend.hosted import _archive_opens_here
+
+    assert _archive_opens_here(b"") is None
+    assert _archive_opens_here(b"not a gzip at all") is None
+
+    def raises_zlib(*_a, **_k):
+        raise zlib.error("Error -3 while decompressing data: invalid code lengths set")
+
+    monkeypatch.setattr(hosted_mod.tarfile, "open", raises_zlib)
+    assert _archive_opens_here(b"anything") is None
 
 
 # -- signing in ---------------------------------------------------------------------
@@ -543,3 +1194,451 @@ def test_an_ordinary_500_is_still_retried(monkeypatch):
     monkeypatch.setattr(client._client, "request", fake_request)
     assert client.request("GET", "/v1/instances").json() == {"ok": True}
     assert len(calls) == 3
+
+
+# -- the Sandbox cycling underneath a call (F-58) ------------------------------
+
+
+def _slept(monkeypatch) -> list[float]:
+    """Every delay the retry loop asks for, without spending any of it."""
+    waits: list[float] = []
+    monkeypatch.setattr(hosted_mod.time, "sleep", waits.append)
+    return waits
+
+
+def _gone(retry_after: str | None = "5") -> httpx.Response:
+    return response(
+        409,
+        {"error": "sandbox_gone", "message": "the sandbox for this instance is gone"},
+        headers={"Retry-After": retry_after} if retry_after else {},
+    )
+
+
+def test_a_read_waits_out_a_vanished_sandbox_instead_of_failing_the_tool_call(monkeypatch):
+    """9 of 68 tool calls in one live study and 56 of 244 in another came back
+    `sandbox_gone (409)` while the hosted Sandbox cycled under an 8-rank solve. Nothing
+    was lost -- `/work` is a persistent Volume and the job restarted from the latest
+    time -- but every one of them reached the model, which spent about 16 minutes of
+    one run improvising recovery and relaunched the same stage five times. A stat five
+    seconds later answers."""
+    waits = _slept(monkeypatch)
+    client = FoamdClient("https://example.invalid", "of_live_test")
+    calls = []
+
+    def cycling(method, path, timeout=None, **kwargs):
+        calls.append(method)
+        if len(calls) == 1:
+            return _gone()
+        return response(200, {"ok": True})
+
+    monkeypatch.setattr(client._client, "request", cycling)
+    assert client.request("GET", "/v1/instances/i/files").json() == {"ok": True}
+    assert calls == ["GET", "GET"]
+    assert waits == [5.0], "the service says when the replacement is up; that is the wait"
+
+
+def test_a_vanished_sandbox_is_asked_again_once_and_then_reported(monkeypatch):
+    """Two attempts, not five. This is a read waiting for a container to come back,
+    and if it has not by the second ask the model is better told plainly than left
+    sitting: it can restart the job, which is what the volume makes cheap."""
+    waits = _slept(monkeypatch)
+    client = FoamdClient("https://example.invalid", "of_live_test")
+    calls = []
+
+    def always_gone(method, path, timeout=None, **kwargs):
+        calls.append(method)
+        return _gone()
+
+    monkeypatch.setattr(client._client, "request", always_gone)
+    with pytest.raises(BackendError) as caught:
+        client.request("GET", "/v1/instances/i/files")
+
+    assert caught.value.code == "sandbox_gone"
+    assert caught.value.status == 409
+    assert len(calls) == 2, f"asked {len(calls)} times; the cap is two attempts"
+    assert waits == [5.0]
+
+
+def test_a_vanished_sandbox_is_not_a_reason_to_start_a_job_twice(monkeypatch):
+    """The negative case, and the reason 409 is not simply added to
+    `_RETRY_STATUSES`. That set is keyed on the status alone, so putting 409 in it
+    would cover `POST .../jobs` as well -- and a retried job start once produced five
+    duplicate running jobs on one instance. `job_start` needs an idempotency key
+    before it can be sent twice; until it has one it is handed to the caller on the
+    first answer."""
+    from openreynolds.backend.hosted import HostedBackend
+
+    _slept(monkeypatch)
+    client = FoamdClient("https://example.invalid", "of_live_test")
+    calls = []
+
+    def always_gone(method, path, timeout=None, **kwargs):
+        calls.append((method, path))
+        return _gone()
+
+    monkeypatch.setattr(client._client, "request", always_gone)
+    with pytest.raises(BackendError) as caught:
+        HostedBackend(client, "inst-1").job_start("mpirun -np 8 pimpleFoam -parallel")
+
+    assert caught.value.code == "sandbox_gone"
+    assert len(calls) == 1, f"the solve was launched {len(calls)} times"
+
+
+def test_a_vanished_sandbox_does_not_repeat_a_write_even_a_repeatable_one(monkeypatch):
+    """`repeatable=True` answers a different question -- whether sending the same
+    bytes twice leaves the workspace as once does -- and it is not the one asked here.
+    A gone Sandbox cannot be asked what the request did before it went, so the gate is
+    the method being one that only reads."""
+    _slept(monkeypatch)
+    client = FoamdClient("https://example.invalid", "of_live_test")
+    calls = []
+
+    def always_gone(method, path, timeout=None, **kwargs):
+        calls.append(method)
+        return _gone()
+
+    monkeypatch.setattr(client._client, "request", always_gone)
+    with pytest.raises(BackendError):
+        client.request("POST", "/v1/instances/i/tar", repeatable=True)
+    assert len(calls) == 1
+
+
+def test_only_sandbox_gone_is_carved_out_of_the_409s(monkeypatch):
+    """One code, not the status. `409 kill_not_delivered` says a job may still be
+    running and the kill did not reach it, which is a fact about the workspace and not
+    a blink: asking again tells the model nothing new and costs it the seconds."""
+    _slept(monkeypatch)
+    from openreynolds.backend.hosted import _RETRY_STATUSES
+
+    assert 409 not in _RETRY_STATUSES
+    client = FoamdClient("https://example.invalid", "of_live_test")
+    calls = []
+
+    def refused(method, path, timeout=None, **kwargs):
+        calls.append(method)
+        return response(409, {"error": "kill_not_delivered",
+                              "message": "the signal did not reach the job"})
+
+    monkeypatch.setattr(client._client, "request", refused)
+    with pytest.raises(BackendError) as caught:
+        client.request("GET", "/v1/jobs/j")
+
+    assert caught.value.code == "kill_not_delivered"
+    assert len(calls) == 1
+
+
+def test_a_sandbox_gone_wait_is_capped(monkeypatch):
+    """`Retry-After` is honoured verbatim, which is right for a header the service
+    chose; the cap bounds what a header nobody is watching can add to a tool call that
+    is already slow. At the 5 seconds foamd sends it never binds."""
+    waits = _slept(monkeypatch)
+    client = FoamdClient("https://example.invalid", "of_live_test")
+    calls = []
+
+    def cycling(method, path, timeout=None, **kwargs):
+        calls.append(method)
+        if len(calls) == 1:
+            return _gone("600")
+        return response(200, {"ok": True})
+
+    monkeypatch.setattr(client._client, "request", cycling)
+    assert client.request("GET", "/v1/instances").status_code == 200
+    assert waits == [15.0]
+
+
+def test_a_sandbox_gone_without_a_header_still_waits_a_little(monkeypatch):
+    """An older service, or an edge that drops the header. The general backoff applies
+    and the read is still absorbed rather than spent on a model turn."""
+    waits = _slept(monkeypatch)
+    client = FoamdClient("https://example.invalid", "of_live_test")
+    calls = []
+
+    def cycling(method, path, timeout=None, **kwargs):
+        calls.append(method)
+        if len(calls) == 1:
+            return _gone(None)
+        return response(200, {"ok": True})
+
+    monkeypatch.setattr(client._client, "request", cycling)
+    assert client.request("GET", "/v1/instances").status_code == 200
+    assert waits == [1.0]
+
+
+# -- who owns the workspace at teardown ---------------------------------------
+
+
+class _Joining:
+    """A service that lists one instance and answers the start route.
+
+    The one fact `acquire` has to get right is whether THIS call brought the Sandbox
+    up, because that is what decides whether the session stops it on the way out.
+    """
+
+    def __init__(self, listed_status, start_reply):
+        self.listed_status = listed_status
+        self.start_reply = start_reply
+        self.closed = False
+
+    def list_instances(self):
+        return [{"id": "iid-1", "status": self.listed_status}]
+
+    def create_instance(self):
+        raise AssertionError("there was one to join")
+
+    def start_instance(self, instance_id):
+        return self.start_reply
+
+    def close(self):
+        self.closed = True
+
+
+def _acquired(monkeypatch, listed_status, start_reply):
+    client = _Joining(listed_status, start_reply)
+    monkeypatch.setattr(hosted_mod, "FoamdClient", lambda *a, **k: client)
+    backend, _client, _iid = hosted_mod.acquire("https://svc.example", "of_live_test")
+    return backend
+
+
+def test_the_start_route_decides_who_owns_the_workspace(monkeypatch):
+    """The listing is read BEFORE the start call and a fresh row reads `stopped`, so
+    two sessions listing within the same second both concluded they had started the
+    workspace -- and the first to exit stopped it from under the other. The start
+    route knows which of the two it did, so it is asked."""
+    joined = _acquired(monkeypatch, "stopped", {"id": "iid-1", "status": "running",
+                                                "started_new": False})
+    assert joined.was_already_running is True, "it joined a Sandbox somebody else had"
+
+    started = _acquired(monkeypatch, "stopped", {"id": "iid-1", "status": "running",
+                                                 "started_new": True})
+    assert started.was_already_running is False, "this call is the one that built it"
+
+
+def test_a_service_that_does_not_say_leaves_the_old_answer_standing(monkeypatch):
+    """`started_new` is additive, so an older deployment answers without it. There the
+    pre-start listing is all there is, which is the behaviour this has always had."""
+    running = _acquired(monkeypatch, "running", {"id": "iid-1", "status": "running"})
+    assert running.was_already_running is True
+
+    stopped = _acquired(monkeypatch, "stopped", {"id": "iid-1", "status": "running"})
+    assert stopped.was_already_running is False
+
+
+# -- which of several workspaces gets joined -----------------------------------
+
+
+class _Several:
+    """A service answering for an account that holds more than one instance.
+
+    The rows come back in an order that is deliberately not the order they should be
+    chosen in. Nothing asks the service to sort `GET /v1/instances`, so the listing
+    arrives in whatever order the database hands over -- which is what made
+    `existing[0]` a coin toss rather than a choice.
+    """
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.started = []
+        self.created = 0
+        self.closed = False
+
+    def list_instances(self):
+        return list(self.rows)
+
+    def create_instance(self):
+        self.created += 1
+        return "iid-new"
+
+    def start_instance(self, instance_id):
+        self.started.append(instance_id)
+        return {"id": instance_id, "status": "running", "started_new": False}
+
+    def close(self):
+        self.closed = True
+
+
+def _acquire_against(monkeypatch, rows):
+    client = _Several(rows)
+    monkeypatch.setattr(hosted_mod, "FoamdClient", lambda *a, **k: client)
+    backend, _client, instance_id = hosted_mod.acquire("https://svc.example", "of_live_test")
+    return client, backend, instance_id
+
+
+def test_acquire_joins_the_most_recently_active_instance_when_the_account_holds_several(
+    monkeypatch,
+):
+    """The service's cap on concurrent instances is no longer 1, so an account can
+    hold several workspaces at once and each one is a separate Volume with its own
+    files. `existing[0]` on an unsorted listing attached a resumed session to an
+    arbitrary one of them, and the study's case directory then simply was not there --
+    a failure that reads as a workspace that lost its files, not as the wrong
+    workspace. The ordering is `coalesce(last_active_at, created_at) desc, created_at
+    desc`, which is what `OpenFoam_Instance/sql/schema_f16.sql`'s repair step uses to
+    pick the row a client is most likely still holding; the two have to agree."""
+    client, backend, chosen = _acquire_against(
+        monkeypatch,
+        [
+            {"id": "iid-oldest", "status": "running",
+             "created_at": "2026-09-01T00:00:00+00:00",
+             "last_active_at": "2026-09-02T00:00:00+00:00"},
+            {"id": "iid-newest", "status": "running",
+             "created_at": "2026-09-03T00:00:00+00:00",
+             "last_active_at": "2026-09-11T23:59:00+00:00"},
+            {"id": "iid-middle", "status": "stopped",
+             "created_at": "2026-09-05T00:00:00+00:00",
+             "last_active_at": "2026-09-06T00:00:00+00:00"},
+        ],
+    )
+
+    assert chosen == "iid-newest"
+    assert backend.instance_id == "iid-newest"
+    assert client.started == ["iid-newest"], "and it is the one that was started"
+    assert client.created == 0, "joining, never a sixth workspace nobody asked for"
+    assert backend.instances_held == 3, (
+        "the count is carried out so the session can say which of several it took"
+    )
+
+
+def test_acquire_falls_back_to_created_at_when_an_instance_has_never_been_active(
+    monkeypatch,
+):
+    """`last_active_at` is null on a row that has never been started, which is exactly
+    the workspace a user made a minute ago and is about to open. Ordering on the raw
+    column would sort that null against real timestamps; the coalesce is why a
+    brand-new instance is preferred over one last touched a week ago."""
+    _client, _backend, chosen = _acquire_against(
+        monkeypatch,
+        [
+            {"id": "iid-stale", "status": "stopped",
+             "created_at": "2026-09-01T00:00:00+00:00",
+             "last_active_at": "2026-09-04T00:00:00+00:00"},
+            {"id": "iid-fresh", "status": "stopped",
+             "created_at": "2026-09-12T08:00:00+00:00",
+             "last_active_at": None},
+        ],
+    )
+
+    assert chosen == "iid-fresh"
+
+
+def test_acquire_ignores_deleted_rows_when_it_counts_and_when_it_chooses(monkeypatch):
+    """A deleted instance's Volume is gone, so joining one is joining nothing -- and
+    counting one would make the notice claim workspaces the account no longer has."""
+    _client, backend, chosen = _acquire_against(
+        monkeypatch,
+        [
+            {"id": "iid-gone", "status": "deleted",
+             "created_at": "2026-09-11T00:00:00+00:00",
+             "last_active_at": "2026-09-12T09:00:00+00:00"},
+            {"id": "iid-live", "status": "running",
+             "created_at": "2026-09-01T00:00:00+00:00",
+             "last_active_at": "2026-09-02T00:00:00+00:00"},
+        ],
+    )
+
+    assert chosen == "iid-live"
+    assert backend.instances_held == 1
+
+
+def test_acquire_still_joins_the_only_instance_when_the_account_holds_one(monkeypatch):
+    """The case every session took before the cap moved, unchanged: one live row, and
+    it is joined rather than added to. The count says one, so the session says nothing
+    about other workspaces -- there are none to mention."""
+    client, backend, chosen = _acquire_against(
+        monkeypatch,
+        [
+            {"id": "iid-1", "status": "running",
+             "created_at": "2026-09-01T00:00:00+00:00",
+             "last_active_at": "2026-09-02T00:00:00+00:00"},
+        ],
+    )
+
+    assert chosen == "iid-1"
+    assert client.started == ["iid-1"]
+    assert client.created == 0
+    assert backend.instances_held == 1
+
+
+def test_acquire_told_which_instance_to_use_never_lists_and_reports_no_count(monkeypatch):
+    """`--instance` and the remembered session id are an answer, not a question, so
+    there is nothing to choose between and nothing to count. The count reads 0 for
+    "nobody counted", which is why the notice checks for more than one rather than
+    for anything else."""
+    client = _Several([])
+    monkeypatch.setattr(hosted_mod, "FoamdClient", lambda *a, **k: client)
+
+    def refuse():
+        raise AssertionError("it was told which workspace to use")
+
+    client.list_instances = refuse
+    backend, _client, chosen = hosted_mod.acquire(
+        "https://svc.example", "of_live_test", "iid-asked-for"
+    )
+
+    assert chosen == "iid-asked-for"
+    assert backend.instances_held == 0
+
+
+def test_acquire_creates_one_workspace_when_the_account_holds_none(monkeypatch):
+    """And reports holding exactly the one it just made, so a first session does not
+    announce workspaces that do not exist."""
+    client, backend, chosen = _acquire_against(monkeypatch, [])
+
+    assert chosen == "iid-new"
+    assert client.created == 1
+    assert backend.instances_held == 1
+
+
+# -- End's checkpoint (#51) ---------------------------------------------------------
+
+
+def test_a_checkpoint_asks_for_the_paths_and_waits_for_the_copy():
+    import json as _json
+
+    from openreynolds.backend.hosted import HostedBackend
+
+    seen: list[httpx.Request] = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json={"id": "inst-1", "status": "running", "checkpoint": {
+            "files": 4, "manifest_key": "ws/manifest.json", "taken_at": "2026-10-21T10:00:00Z"}})
+
+    backend = HostedBackend(_client_against(httpx.MockTransport(handler)), "inst-1")
+    answer = backend.checkpoint(["/work/s1"], timeout_s=60)
+    assert answer["checkpoint"]["taken_at"] == "2026-10-21T10:00:00Z"
+    assert [(r.method, r.url.path) for r in seen] == [("POST", "/v1/instances/inst-1/checkpoint")]
+    assert _json.loads(seen[0].content) == {"paths": ["/work/s1"], "timeout_s": 60}
+
+
+def test_a_checkpoint_that_failed_is_raised_with_the_services_reason():
+    from openreynolds.backend.base import BackendError
+    from openreynolds.backend.hosted import HostedBackend
+
+    transport = httpx.MockTransport(lambda request: httpx.Response(502, json={
+        "error": "checkpoint_failed", "message": "the workspace could not be copied: S3 AccessDenied"}))
+    backend = HostedBackend(_client_against(transport), "inst-1")
+    with pytest.raises(BackendError) as raised:
+        backend.checkpoint(["/work/s1"], timeout_s=60)
+    assert "AccessDenied" in raised.value.message
+
+
+@pytest.mark.parametrize("status, outcome", [(204, "revoked"), (401, "already"), (404, "unsupported"), (405, "unsupported")])
+def test_a_key_revokes_itself_with_its_own_bearer(status, outcome):
+    from openreynolds.backend.hosted import revoke_own_key
+
+    seen = []
+
+    def handler(request):
+        seen.append((request.method, request.url.path, request.headers.get("authorization")))
+        return httpx.Response(status, json={"error": "x", "message": "y"} if status >= 400 else None)
+
+    assert revoke_own_key("https://svc.example/", "of_live_k", transport=httpx.MockTransport(handler)) == outcome
+    assert seen == [("DELETE", "/v1/keys/self", "Bearer of_live_k")]
+
+
+def test_a_service_that_fails_the_revoke_is_an_error():
+    from openreynolds.backend.hosted import revoke_own_key
+
+    transport = httpx.MockTransport(lambda request: httpx.Response(503, json={"error": "busy", "message": "try later"}))
+    with pytest.raises(BackendError):
+        revoke_own_key("https://svc.example", "of_live_k", transport=transport)

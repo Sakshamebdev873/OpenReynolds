@@ -14,11 +14,12 @@ import time
 from contextlib import contextmanager, nullcontext
 from typing import Any, Callable
 
+from . import ceiling, modes, solvers
 from .config import CONTEXT_REFRESH_FRACTION, CONTEXT_WINDOW_TOKENS, Config
-from .llm import BadRequest, Listener, Turn, make_provider
+from .llm import BadRequest, Listener, Turn, make_provider, refusal_line
 from .prompt import system_prompt
 from .store import Store
-from .tools import TOOLS, ToolContext, describe, dispatch
+from .tools import TOOLS, ToolContext, describe, dispatch, tools_for
 from .view import View
 
 MAX_TOKENS = 64_000
@@ -47,6 +48,46 @@ to be re-written to save re-reading about 107,000 cached ones, a net loss of rou
 Bytes are what actually failed, so bytes are what triggers it now. Under the budget
 nothing is evicted and the cache prefix is never touched."""
 
+LEFT_MID_TURN = (
+    "The person ended the session while this turn was running, so the turn stops here: "
+    "the tool calls already in flight finished, no further call was made, and the model "
+    "was not asked again."
+)
+"""The one line the transcript carries when a turn is ended by the person rather than by
+the model. In the harness's voice (`tell`): the person did not say it, and the model
+did not decide it."""
+
+ROUTING_STAGE = "choosing the solver"
+"""What the view and the bar say while an open solver is being routed (`Loop._route`)."""
+
+NOT_RUN_LEFT = "This call did not run: the person ended the session."
+"""The result of a tool call the model asked for and the turn did not start, because the
+person had left by the time it was reached. The shape `settle` gives an interrupted
+turn's calls, so the thread stays one the API would accept."""
+
+
+NOT_RUN_STOPPED = ("This call did not run: the study met its spending ceiling and the "
+                   "ceiling was not raised, so the study stopped.")
+"""The result of a call the turn did not start because an earlier one in the batch met
+the study's ceiling and the person did not raise it (`ceiling.resolve`)."""
+
+
+class StartRefused(Exception):
+    """The study's workspace could not be started, so the model was not asked.
+
+    Raised by `Loop.run` before the first request of a turn when the session's start
+    has failed (`Loop.start_refused`): a plan limit, a quota, a study paused at its
+    ceiling, a start that errored. The person's message is already in the thread and
+    the transcript; the refusal is what they are shown, and nothing is spent on the
+    model to say it again in other words (`cli._run_turn` handles it). A turn that is
+    already running when the start fails is not stopped by this -- only the next one
+    is not begun. A `/btw` side question is not held back either: the side chat asks
+    the model on its own thread (`desk.SideChat`), never through `run`."""
+
+    def __init__(self, error: Exception):
+        super().__init__(str(error))
+        self.error = error
+
 
 class Loop:
     """One conversation thread against one workspace."""
@@ -74,8 +115,68 @@ class Loop:
         """Held around each tool call (`mirror.Gate`), so the background mirror can
         stand aside for it: its transfers share the container with the command and
         the command waited behind them -- a 27 s finish step took five minutes."""
+        self.approver: Any | None = None
+        """Puts a call to the person when they chose to be consulted (`modes.py`,
+        `approval.Approver`). None when nobody can answer. Never consulted in auto."""
+        self._notes: list[str] = []
+        """Harness facts waiting for a place in the thread. Said mid-turn (a `/mode`
+        switch typed while tools run) they cannot be a message of their own: the next
+        message has to be the tool results. They ride in that message instead."""
+        self._typed: list[str] = []
+        """What the person typed mid-turn that is for the model, waiting to ride after
+        this batch's tool results (`_turns`). Filled by `_gather`, which drains the
+        inbox before each tool call, after the batch, and -- through `heard` -- every
+        second a tool is waiting. One list rather than a local, because a waiting tool
+        has to be able to ask whether it is empty."""
+        self._mid_turn = False
+        self.leaving = False
+        """Whether the person has ended the session: `/exit`, `/quit` or an EOF, met by
+        the drain while a turn was running (`leave`, from `cli._typed_while_working`).
+        From then on the turn ends at its next safe point -- a wait in progress returns
+        (`ToolContext.on_leaving`), a call already running finishes, no further call
+        starts, the model is not asked again -- and the session's close-down follows.
+        A prompt-time `/exit` never sets this: nothing is running to stop."""
+        self._posted: list[str] = []
+        """Harness facts said from another thread (`post`), waiting for this thread to
+        pick them up at one of its own safe points. `messages` is read while a request
+        is being built and appended to when the answer lands, and neither of those
+        may be interleaved with a write from elsewhere."""
+        self._posted_lock = threading.Lock()
+        self._forwarded: list[tuple[str, str]] = []
+        """What the side chat passed on (`forward`): the person's own words from a
+        `/btw` question, and the side chat's optional note. Written from the side
+        chat's thread, so behind `_posted_lock`; drained by `_gather` with what was
+        typed, which is what makes a held wait end for it as it ends for a message."""
+        self.last_request: dict[str, Any] | None = None
+        """The arguments of the last request this thread sent: model, system, tools,
+        effort, max_tokens, and the messages as they were at that moment (a list of its
+        own; the thread goes on growing). The side chat's fork point (`desk.SideChat`):
+        a `/btw` question is this request again with one message appended, which is the
+        only shape that reads the whole conversation from the prompt cache."""
+        self.router: Callable[[str], str] | None = None
+        """For a study whose solver is still open (`auto`): settles it from the
+        person's first message, before the first request (`desk.route`, wired by
+        `cli.session`), and returns the briefing the thread opens with. None for a
+        study whose solver is known, which is every study once this has run."""
+        self.routed: str | None = None
+        """The briefing `route_ahead` already wrote, waiting for the first message."""
+        self.start_refused: Callable[[], Exception | None] | None = None
+        """Why the session's workspace start failed, asked before a turn's first
+        request; None while it is coming or is here (`cli._start_refused`). None
+        itself for a session with nothing to start (a local workspace)."""
+        self.start_refusal: str | None = None
+        """What the last refused turn was refused with (`StartRefused`), for a
+        one-shot run to end on. Cleared by a turn that runs."""
+        self.recorder: Any | None = None
+        """The study's trace, when this machine shares (`sharing.Recorder`, wired by
+        `cli.session`): told every model turn, tool call and recorded message. It hears
+        and never speaks -- nothing it does reaches the thread or the model."""
 
         headers = {"X-Study-Id": store.session.study_id}
+        self.study_headers = headers
+        """What every model client of this session sends: the main loop's, the CAD
+        desk's and the reviewer's (`cli.session` hands it to each). The service tags the
+        spend with the study and refuses a trial account's call without it."""
         # Without a timeout a stalled connection is indistinguishable from a model
         # thinking hard, and the session stops dead with nothing said. A failure is
         # recoverable -- it is reported and the thread survives -- silence is not.
@@ -104,6 +205,14 @@ class Loop:
         """Consecutive model-API failures. Reset on any turn that completes; used to
         escalate from "the thread is intact" to a plain explanation once it is clearly
         not a one-off (a rate limit, a usage cap) rather than a blip."""
+        self.images_dropped = False
+        """Whether this stretch of failures has already had its pictures stripped.
+
+        `drop_images` is a one-shot repair, not a retry policy. If a turn still fails
+        after every image is gone then the images were not the problem, and trying the
+        same thing again would be the twenty-six-minute loop `blocked_reason` exists to
+        prevent. Cleared by any turn that completes, so a later refusal in a longer
+        session gets its own attempt."""
         self.blocked_reason: str | None = None
         """Why the model service refused the last call, when waiting cannot fix it.
 
@@ -115,6 +224,16 @@ class Loop:
         on the page while the person typed "whats going on?". Set here so the caller
         can stop asking; cleared by any turn that completes and by the user speaking.
         """
+        self.pending_model: Any | None = None
+        """A model or provider switch the person asked for (`/model`), already checked,
+        waiting for the next `run` to start (`switch.apply`). Applied there and nowhere
+        else, so a turn is never half one model and half another."""
+        self.refresh_due = False
+        """The pending switch's window cannot hold this thread, so it is refreshed on
+        the current model first; `pending_model` waits until that is done."""
+        self.running = False
+        """Whether a `run` is in flight -- what tells the person a switch applies now
+        or when the current turn ends."""
 
     @property
     def client(self) -> Any:
@@ -142,6 +261,12 @@ class Loop:
         self.messages.append({"role": "user", "content": text})
         self._record("event", text)
 
+    def event(self, text: str) -> None:
+        """Record a harness fact in the transcript only, for the person: nothing is
+        added to the thread, so the model is not told and the cache is not touched.
+        What a failed request leaves behind (`cli._run_turn`)."""
+        self._record("event", text)
+
     def inform(self, text: str) -> None:
         """Add harness-authored facts.
 
@@ -157,6 +282,94 @@ class Loop:
             self.messages.append({"role": "user", "content": _as_operator_text(text)})
         self._record("event", text)
 
+    def tell(self, text: str) -> None:
+        """`inform`, from wherever it is safe to be.
+
+        Between a turn's tool calls the next message must be their results, so a fact
+        said then waits and rides in that message as a marked text block. Anywhere
+        else it is an ordinary `inform`."""
+        if self._mid_turn:
+            self._notes.append(text)
+            self._record("event", text)
+        else:
+            self.inform(text)
+
+    def post(self, text: str) -> None:
+        """`tell`, from a thread that is not this loop's.
+
+        The workspace coming up, and the facts about it that the briefing could not
+        wait for, are learned on a background thread while the model may be mid-turn
+        on this one. `tell` straight from there would race the request being built;
+        this only queues, and `_drain_posted` hands the fact over at the next point
+        where this thread would have said it itself -- before a request goes out, or
+        between one tool call and the next. Nothing is lost if no turn is running:
+        the note is the first thing the next turn's request carries."""
+        with self._posted_lock:
+            self._posted.append(text)
+
+    def _drain_posted(self) -> None:
+        with self._posted_lock:
+            posted, self._posted = self._posted, []
+        for text in posted:
+            self.tell(text)
+
+    def _take_notes(self) -> list[dict[str, Any]]:
+        notes = [{"type": "text", "text": _as_operator_text(note)} for note in self._notes]
+        self._notes = []
+        return notes
+
+    def forward(self, words: str, note: str = "") -> bool:
+        """The side chat passing on a `/btw` question, from its own thread.
+
+        Delivered the way a message typed mid-turn is: the person's `words`, exactly as
+        they typed them, ride after this batch's tool results and are recorded as theirs
+        (`_gather`, `_turns`); the side chat's `note`, if it wrote one, follows as a
+        harness note that says whose it is. A held wait ends for it as for any message
+        (`heard`). Returns False when no turn is running to deliver it to -- the caller
+        then hands the words to the prompt like a typed line (`cli._deliver_forward`) --
+        and True when it is queued. Asked and answered under the same lock `run` takes
+        to say it has finished, so a forward can never land in a turn that has already
+        read its last message (`take_forwarded`)."""
+        with self._posted_lock:
+            if not self.running:
+                return False
+            self._forwarded.append((words, note))
+            return True
+
+    def take_forwarded(self) -> list[tuple[str, str]]:
+        """Whatever was forwarded after the turn's last drain. Empty unless the side
+        chat finished between the turn's last tool batch and its end."""
+        with self._posted_lock:
+            taken, self._forwarded = self._forwarded, []
+        return taken
+
+    def set_mode(self, mode: str) -> str | None:
+        """Switch how much the person is consulted. Returns the mode, or None if the
+        name is not one.
+
+        Takes effect at the next tool call: `_consult` reads `ctx.mode` every time.
+        Entering structured mode starts it afresh, so a plan has to be approved in it
+        before compute is spent. The model is told in the harness's voice, as a note in
+        a user turn (`tell`), because what gets held and what `checkpoint` does change
+        under it. Nothing else does: the system prompt never mentions the mode, and the
+        tool list is the same in every mode (`tools_for`) -- a list that changed here
+        would invalidate every thinking block in the thread on a provider that checks
+        what they are bound to."""
+        canonical = modes.normalize(mode)
+        if canonical is None:
+            return None
+        previous = self.ctx.mode
+        self.ctx.mode = canonical
+        self.cfg.mode = canonical
+        if canonical == modes.STRUCTURED and previous != modes.STRUCTURED:
+            self.ctx.plan_approved = False
+        self.store.session.mode = canonical
+        self.store.save()
+        self.view.mode(canonical)
+        if canonical != previous:
+            self.tell(modes.switched(canonical))
+        return canonical
+
     @staticmethod
     def _fold_system(message: dict[str, Any]) -> dict[str, Any]:
         """A `system` turn as a marked user turn; anything else passed straight through.
@@ -171,15 +384,119 @@ class Loop:
 
     def run(self) -> Turn:
         """Stream turns and dispatch tools until the model ends its turn."""
+        if self.pending_model is not None and not self.refresh_due:
+            # Every earlier assistant turn is complete here, so this is the one place a
+            # switch cannot split a turn between two models.
+            from . import switch
+
+            switch.apply(self)
+        # Running from here, routing included: the routing request is this turn's
+        # first wait, and a turn that is choosing its solver is a turn in flight -- to
+        # the side chat's `forward`, and to anything asking whether the agent is busy.
+        with self._posted_lock:
+            self.running = True
+        # A stop at the ceiling is this turn's, not the session's: the person speaking
+        # again is what starts the next one, and if the study is still paused the
+        # first call says so and the question is asked again.
+        self.ctx.stopped = None
+        try:
+            if self.routed is not None or (
+                getattr(self.ctx, "solver", None) == solvers.AUTO and self.router is not None
+            ):
+                self._route()
+            refused = self.start_refused() if self.start_refused is not None else None
+            if refused is not None:
+                # The workspace will not come, so neither does an answer: the person
+                # is shown the refusal, and the model is not asked to repeat it. What
+                # the start said in the thread is put there now, so the transcript
+                # carries it beside the message it held back.
+                self._drain_posted()
+                self.start_refusal = str(refused)
+                raise StartRefused(refused)
+            self.start_refusal = None
+            return self._turns()
+        finally:
+            with self._posted_lock:
+                self.running = False
+
+    def _route(self) -> None:
+        """Settle an open solver before the first request, and open the thread.
+
+        The router (`cli.session`'s, which asks `desk.route`) reads what the person
+        said, fixes the solver, starts its workspace and returns the briefing; the
+        briefing goes in front of what the person said, where `brief` would have put
+        it had it been known before they spoke. The request that follows is the first
+        this thread sends, with the chosen solver's prompt and tools -- and so is every
+        request after it."""
+        said = next(
+            (m["content"] for m in reversed(self.messages)
+             if m.get("role") == "user" and isinstance(m.get("content"), str)),
+            "",
+        )
+        router, self.router = self.router, None
+        if self.routed is not None:
+            briefing, self.routed = self.routed, None
+            self.messages.insert(0, {"role": "user", "content": briefing})
+            self._record("event", briefing)
+            return
+        # Said, because nothing else is: the routing request and the workspace's
+        # reservation take seconds -- 14 in the first production study routed this way
+        # (20261019-013223-f805) -- before the first streamed token, which is what used
+        # to tell a view the agent was working. Without this the hosted page still read
+        # "your turn" from its idle prompt, an MCP caller polling it was told the
+        # agent had finished its turn with nothing in the transcript, and ended the
+        # study. A stage and the bar, not a draft: no model output is on its way yet.
+        self.view.working(ROUTING_STAGE)
+        self._busy(ROUTING_STAGE)
+        try:
+            briefing = router(said)
+        finally:
+            self._unbusy()
+        if briefing:
+            self.messages.insert(0, {"role": "user", "content": briefing})
+            self._record("event", briefing)
+
+    def route_ahead(self, said: str) -> None:
+        """Settle an open solver now, from words the person has said that are held back
+        from the model: a first message waiting for its attachments to upload, or for
+        a gallery case to be copied in. Both wait for the workspace, and the workspace
+        waited for the solver, which was chosen from that very message -- so nothing
+        moved (#61 on the web app). Routed here, the workspace starts at once, and the
+        briefing waits for the message to arrive (`_route`), as if it had come with it.
+
+        A routing that raises is left for the first message to try again."""
+        if self.router is None or not said.strip():
+            return
+        router = self.router
+        self.view.working(ROUTING_STAGE)
+        self._busy(ROUTING_STAGE)
+        try:
+            self.routed = router(said)
+        except Exception:  # noqa: BLE001 - the first message routes as it always did
+            return
+        finally:
+            self._unbusy()
+            # Nothing streams after this one: the message it was for is still held.
+            self.view.stage("")
+        self.router = None
+
+    def _turns(self) -> Turn:
         step = 0
         while True:
             step += 1
             started = time.monotonic()
+            # Anything another thread has learned since the last request rides in
+            # this one: a `system` turn here, after the user's message or the tool
+            # results, is where `inform` would have put it.
+            self._drain_posted()
             response = self._send()
+            if self.recorder is not None:
+                self.recorder.turn(response, time.monotonic() - started)
 
+            if response.declined:
+                self._fell_back(response)
             if response.stop_reason == "refusal":
-                reason = response.stop_explanation or "no explanation given"
-                self.view.notice(f"The model declined this request: {reason}")
+                self.view.notice(refusal_line(response))
                 return response
 
             self.messages.append(response.as_message())
@@ -200,26 +517,210 @@ class Loop:
                 return response
 
             results: list[Any] = []
-            for block in tool_uses:
-                results.append(self._run_tool(block))
+            self._mid_turn = True
+            try:
+                for block in tool_uses:
+                    # What was typed so far is read before each call, not only after the
+                    # batch. Two things depend on it: a `/mode` typed while an earlier
+                    # call ran governs this one (a switch applies from the next tool
+                    # call), and a line typed before a question exists is an
+                    # interjection, never the answer to a question the person has not
+                    # seen yet (`Approver.ask` reads only what arrives after this).
+                    self._gather()
+                    if self.leaving:
+                        # The person ended the session while an earlier call in this
+                        # batch ran, or before the first one started. A call not yet
+                        # started is not started, and is answered the way `settle`
+                        # answers an interrupted turn's, so every tool_use still has
+                        # its tool_result. A call already running when they left -- a
+                        # bash command, a job_start -- was not cut: each is bounded by
+                        # its own deadline, and its result was recorded when it came
+                        # back. Only the held waits (`job_check` with `wait_s`,
+                        # and a `bash` following a promoted job) look for this and return at once
+                        # (`ToolContext.on_leaving`): a wait is the one call whose
+                        # whole purpose is to keep the turn going.
+                        self.view.tool(block.name, _summarize(block.input))
+                        results.append(self._result(block, NOT_RUN_LEFT, True))
+                        continue
+                    if getattr(self.ctx, "stopped", None):
+                        # An earlier call in this batch met the ceiling and it was
+                        # not raised: the rest are answered, not run.
+                        self.view.tool(block.name, _summarize(block.input))
+                        results.append(self._result(block, NOT_RUN_STOPPED, True))
+                        continue
+                    results.append(self._run_tool(block))
 
-            # One round of think-then-act is over. Marking where each ends is what
-            # makes the loop legible: without it the activity pane is an undivided
-            # column of tool calls, and there is no telling a turn that took three
-            # rounds from one that took thirty.
-            self.view.step(step, time.monotonic() - started, len(tool_uses))
+                # One round of think-then-act is over. Marking where each ends is what
+                # makes the loop legible: without it the activity pane is an undivided
+                # column of tool calls, and there is no telling a turn that took three
+                # rounds from one that took thirty.
+                self.view.step(step, time.monotonic() - started, len(tool_uses))
 
-            # Tool results have to come first in this message, but a text block may
-            # follow them. That is how something typed while the model is working
-            # reaches it at the next turn instead of sitting unread until the whole
-            # turn ends -- the difference between being heard and being ignored.
-            said = self.interject() if self.interject else None
-            if said:
-                results.append({"type": "text", "text": said})
-                self.view.interjection(said)
-                self._record("user", said)
+                # Tool results have to come first in this message, but a text block may
+                # follow them. That is how something typed while the model is working
+                # reaches it at the next turn instead of sitting unread until the whole
+                # turn ends -- the difference between being heard and being ignored.
+                self._gather()
+                said = "\n".join(self._typed) or None
+                self._typed = []
+                if said:
+                    results.append({"type": "text", "text": said})
+                    self.view.interjection(said)
+                    self._record("user", said)
+                stopped = getattr(self.ctx, "stopped", None)
+                if stopped:
+                    # In the thread after the results, so a resume reads why the turn
+                    # ended, and in the transcript as an event.
+                    self.tell(stopped)
+                if self.leaving:
+                    # Said once, here, where the turn actually stops: in the thread as
+                    # a harness note after this batch's results, and in the transcript
+                    # as an event. Whatever the person typed before pressing End is
+                    # above it, delivered and recorded like any other interjection.
+                    self.tell(LEFT_MID_TURN)
+                results.extend(self._take_notes())
+            finally:
+                self._mid_turn = False
 
             self.messages.append({"role": "user", "content": results})
+
+            if getattr(self.ctx, "stopped", None):
+                # The study met its ceiling and it was not raised. Every later request
+                # would be refused at the service's proxy, so the model is not asked
+                # again; the final word is the harness's.
+                self.view.notice(self.ctx.stopped)
+                return response
+
+            if self.leaving:
+                # The turn ends here rather than at the model's next reply. The thread
+                # is whole -- every call the model asked for has an answer -- so a
+                # resume finds nothing dangling; the model is simply not asked again,
+                # because nobody is here to read what it would say. Measured before
+                # this (study 20260921-033019-e1b4): End pressed at 03:33:40 was
+                # honoured at 04:10:46, when the turn ended on its own.
+                self.view.notice(
+                    "the session was ended mid-turn: the turn stopped after the call "
+                    "in flight, and nothing more was sent to the model"
+                )
+                return response
+
+    def leave(self) -> None:
+        """The person has ended the session while a turn is running.
+
+        Called by the drain (`cli._typed_while_working`) when what it takes from the
+        inbox is a `/exit`, a `/quit` or an EOF -- the same three things that end the
+        session at the prompt, met mid-turn. The drain still puts the line back for
+        the prompt, as before; this is the part the put-back could not do. From here
+        the turn ends at its next safe point (`_turns`), and a wait in progress ends
+        at once (`ToolContext.on_leaving`, asked by every held wait once a second
+        beside `heard`).
+
+        The CAD desk is told now rather than at the close-down: a run in flight
+        (`ctx.cad`, holding this very turn) reads its budgets at every lap and stops
+        at its next cell once they are zero (`cad.agent`, `max_steps`/`max_seconds`).
+        It would not otherwise stop for a person who has left: it holds the turn for
+        up to its whole budget, spending model calls the whole way. The session's desk
+        is never used again after this, so nothing is lost by it.
+
+        Idempotent: the drain meets the same put-back line every second a wait asks.
+        """
+        if self.leaving:
+            return
+        self.leaving = True
+        cad = getattr(self.ctx, "cad", None)
+        if cad is not None:
+            try:
+                cad.max_steps = 0
+                cad.max_seconds = 0.0
+            except Exception:  # noqa: BLE001 - a desk without budgets has nothing to stop
+                pass
+
+    def _gather(self) -> None:
+        """Drain what has been typed (`interject`): commands are answered on the spot,
+        and words for the model are kept in `_typed` to ride with this batch's results.
+        What other threads posted meanwhile rides with them too (`_notes`)."""
+        self._drain_posted()
+        said = self.interject() if self.interject else None
+        if said:
+            self._typed.append(said)
+        for words, note in self.take_forwarded():
+            self._typed.append(words)
+            self.tell(forwarded_note(note))
+
+    def heard(self) -> bool:
+        """Whether the person has said something the model has not seen yet.
+
+        What a tool that holds its answer asks, once a second, to know whether to stop
+        holding it (`ToolContext.on_wait_input`; `job_check` with `wait_s`, a promoted `bash`).
+        It drains the inbox the way the loop does between tool calls -- commands are
+        answered on the spot, words for the model are kept for this batch's results --
+        and answers whether anything is kept. So a wait that ends on it ends for words
+        the model is about to read, in the same message as the result that ended.
+
+        WHY THIS IS THE LOOP'S TO ANSWER. It used to be the reader's `pending()`: is
+        there anything in the queue, without taking it. But the loop's own drain does
+        not take everything. `/exit` is put back for whoever waits at the prompt, an
+        EOF likewise, and a `/status` is answered without a word reaching the model.
+        Measured in production (study 20260921-033019-e1b4): a line the drain put back
+        sat in the queue for the rest of the turn, `pending()` answered true to every
+        wait from then on, and `mesh_wait` returned three times in nine seconds with
+        `[waited 0s] [the user said something]` -- and the model, handed nothing the
+        person had said, concluded the tool did not wait and paced the remaining
+        thirty-seven minutes with `bash sleep`. The same shape ran side by side with
+        an unaffected session (20260921-033356-076b) whose `job_check(wait_s=...)`
+        waited its full 120-300 s throughout. A line that is nobody's to deliver to
+        the model cannot end a wait on the model's behalf, and the only way to know
+        which kind of line it is, is to drain it.
+
+        A `/exit` met by that drain is still not "heard" -- there are no words for the
+        model in it -- but it does end the wait, by another question: the drain calls
+        `leave`, and the wait asks `leaving` beside this (`ToolContext.on_leaving`).
+        """
+        self._gather()
+        return bool(self._typed)
+
+    def take_typed(self) -> None:
+        """Put words `heard` gathered between turns into the thread as a user message.
+
+        Inside a turn they ride with the next batch's tool results. Between a failed
+        request and its retry (`cli._run_turn`) there is no batch to ride with, and
+        words left in `_typed` would wait for one that might never come."""
+        said = "\n".join(self._typed) or None
+        self._typed = []
+        if said:
+            self.view.interjection(said)
+            self.say(said)
+
+    def _fell_back(self, response: Turn) -> None:
+        """The model asked for declined this request and another answered it (or
+        declined too): say so, and when one answered, make it the session's model.
+
+        The vendor's advice for a multi-turn conversation is to stay on the model that
+        accepted rather than switch back, and the provider already pins the pair
+        (`Provider.pinned`). Moving `cfg.model` as well keeps `/model` and the status
+        line honest about who is answering, and it is what `/model <the first one>`
+        undoes -- `switch.apply` clears the pin with the switch. Done here, between two
+        complete assistant turns, the same moment a `/model` switch is applied."""
+        if response.stop_reason == "refusal":
+            return  # `refusal_line` says it all in the caller
+        from . import switch
+
+        asked = response.declined[0][0]
+        served = response.model
+        self.view.notice(
+            f"{refusal_line(response)} The session stays on {served}; "
+            f"/model {asked} goes back."
+        )
+        if served == self.cfg.model or not served:
+            return
+        self.cfg.model = served
+        # The declined model's reasoning blocks carry its signature; the one that
+        # answered is the one that will be asked next, so they go the way they do on
+        # any other switch.
+        switch.strip_thinking(self.messages)
+        self.store.session.model = served
+        self.store.save()
+        self.view.model(self.cfg.model, self.cfg.effort, self.cfg.provider)
 
     def _send(self) -> Turn:
         """One streamed request, printing as it arrives."""
@@ -259,7 +760,7 @@ class Loop:
         """
         image_results = []
         carried = 0
-        for message in self.messages:
+        for at, message in enumerate(self.messages):
             if message.get("role") != "user":
                 continue
             content = message.get("content")
@@ -272,7 +773,7 @@ class Loop:
                 if isinstance(inner, list) and any(
                     isinstance(b, dict) and b.get("type") == "image" for b in inner
                 ):
-                    image_results.append(block)
+                    image_results.append((at, block))
                     carried += _image_bytes(inner)
         # Nothing is evicted while the thread is under the byte budget. Every eviction
         # rewrites a block in the middle of the conversation and so invalidates the
@@ -280,7 +781,10 @@ class Loop:
         # picture of a study, to save re-reading tokens that cost a tenth as much.
         if carried <= LIVE_IMAGE_BUDGET:
             return
-        for block in image_results[: max(0, len(image_results) - keep)]:
+        evicted = image_results[: max(0, len(image_results) - keep)]
+        if evicted:
+            self._unbind_after(evicted[0][0])
+        for _, block in evicted:
             inner = block["content"]
             note = next(
                 (b.get("text", "") for b in inner if isinstance(b, dict) and b.get("type") == "text"),
@@ -314,13 +818,21 @@ class Loop:
                 self._busy("writing")
             self.view.text_delta(delta)
 
-        response = self.provider.stream(
+        request = dict(
             model=self.cfg.model,
-            system=system_prompt(),
+            system=system_prompt(getattr(self.ctx, "solver", "openfoam"),
+                                 local=getattr(self.ctx, "local", False)),
             messages=self.messages,
-            tools=TOOLS,
+            tools=tools_for(self.ctx),
             effort=self.cfg.effort,
             max_tokens=MAX_TOKENS,
+        )
+        # Kept before it is sent, with a list of its own: the side chat forks from
+        # exactly this, and a request that fails is still the last one the provider
+        # has a cached prefix for.
+        self.last_request = {**request, "messages": list(self.messages)}
+        response = self.provider.stream(
+            **request,
             listener=Listener(
                 thinking_begin=lambda: self.view.thinking_begin(),
                 thinking=lambda delta: self.view.thinking_delta(delta),
@@ -333,9 +845,82 @@ class Loop:
         self._account(response)
         return response
 
+    def _consult(self, name: str, tool_input: dict[str, Any], before: str = "") -> str | None:
+        """None when this call may run; otherwise the tool result saying why it did not.
+
+        The only place a tool call is ever held, and it holds only what the person
+        chose to have held (`modes.py`). In auto this returns None without looking.
+
+        The CAD desk is not gated: it runs its own model loop on the same workspace,
+        and what it spends is model time rather than a job."""
+        mode = self.ctx.mode
+        if not modes.gated(mode, name):
+            return None
+        if mode == modes.STRUCTURED:
+            return None if self.ctx.plan_approved else modes.held(name)
+        if self.approver is None:
+            return (f"This {name} call did not run: the session is in ask-before-compute "
+                    "mode and nobody is here to answer.")
+        title, detail = _question(name, tool_input, self.ctx.home)
+        if before:
+            detail = f"{before}\n{detail}"
+        self._busy("waiting")
+        try:
+            decision = self.approver.ask("job", title, detail)
+        finally:
+            self._unbusy()
+        if decision.approved:
+            if decision.all:
+                self.set_mode(modes.AUTO)
+            return None
+        if decision.note:
+            return f"This {name} call did not run: the person declined it. What they said: {decision.note}"
+        return f"This {name} call did not run: the person declined it and gave no reason."
+
     def _run_tool(self, block: Any) -> dict[str, Any]:
+        began = time.monotonic()
         self.view.tool(block.name, _summarize(block.input))
         tool_input = dict(block.input)
+        offered = block.name in {tool["name"] for tool in tools_for(self.ctx)}
+        before = self._before_first_solve(block.name, tool_input) if offered else ""
+        refused = self._consult(block.name, tool_input, before) if offered else None
+        if not offered:
+            # Not offered is not served: the same answer as a tool that does not exist.
+            # Before the solver is chosen this is every machine tool, and serving one
+            # would wait on a workspace nobody has started.
+            content, is_error = f"No such tool: {block.name}", True
+        elif refused is not None:
+            content, is_error = refused, True
+        elif block.name == modes.CHECKPOINT:
+            # A question to a person: no mirror gate held while they think, and no
+            # "still running" ticks for a wait that is theirs.
+            self._busy("waiting")
+            try:
+                content, is_error = dispatch(self.ctx, block.name, tool_input, call_id=block.id)
+            finally:
+                self._unbusy()
+        else:
+            content, is_error = self._dispatch(block, tool_input)
+        return self._result(block, content, is_error, seconds=time.monotonic() - began)
+
+    def _before_first_solve(self, name: str, tool_input: dict[str, Any]) -> str:
+        """How far the study may go before it asks, as a multiple of a normal study
+        (nothing for an exempt study), said before the session's first solve
+        (`ceiling.preamble`). A message in the transcript, not a question -- unless the
+        person chose to approve compute, when it is returned to go in the job's
+        question instead. Empty when there is nothing to say."""
+        if name != "job_start":
+            return ""
+        line = ceiling.preamble(self.ctx)
+        if not line:
+            return ""
+        if self.ctx.mode == modes.PARTIAL and self.approver is not None:
+            return line
+        self.view.notice(line)
+        self._record("event", line)
+        return ""
+
+    def _dispatch(self, block: Any, tool_input: dict[str, Any]) -> tuple[Any, bool]:
         self._busy(
             "tool",
             block.name,
@@ -344,9 +929,12 @@ class Loop:
         )
         try:
             with _holding(self.gate), _ticking(self.view, block.name):
-                content, is_error = dispatch(self.ctx, block.name, tool_input)
+                return dispatch(self.ctx, block.name, tool_input, call_id=block.id)
         finally:
             self._unbusy()
+
+    def _result(self, block: Any, content: Any, is_error: bool,
+                seconds: float | None = None) -> dict[str, Any]:
         # A tool result can be content blocks rather than text -- an image, for one --
         # and those go to the model as they are. What gets written down is a
         # description: a megabyte of base64 in the message log helps nobody read it.
@@ -355,6 +943,9 @@ class Loop:
             "tool",
             {"tool": block.name, "input": dict(block.input), "output": written, "error": is_error},
         )
+        if self.recorder is not None:
+            # The same description, never the bytes: an image goes as what it is.
+            self.recorder.tool(block.name, dict(block.input), written, is_error, seconds)
         if is_error:
             self.view.tool_error(written.splitlines()[0] if written else "failed")
         return {
@@ -397,10 +988,13 @@ class Loop:
             "workspace is untouched and this session continues. Anything you want to "
             "carry forward can go on disk now; the next message starts a fresh thread."
         )
-        self.run()
-        self.messages = []
-        self.context_tokens = 0
-        self.brief(blurb)
+        try:
+            self.run()
+        except StartRefused:
+            pass  # nothing can be put on disk without a workspace; the thread goes on
+        self.restart(blurb)
+        # A switch that was waiting for a smaller thread can go ahead at the next run.
+        self.refresh_due = False
 
     def settle(self) -> None:
         """Answer any tool call left dangling by an interrupted turn.
@@ -426,14 +1020,106 @@ class Loop:
                         "is_error": True,
                     }
                     for block in pending
-                ],
+                ]
+                # A fact said during the interrupted turn still belongs in the thread.
+                + self._take_notes(),
             }
         )
 
+    def drop_images(self) -> int:
+        """Replace every image in the thread with a note saying it was dropped.
+
+        Returns how many were replaced, so the caller can tell "there was something to
+        fix" from "this 400 was about something else".
+
+        WHY THIS EXISTS. One picture the API will not accept used to cost a whole
+        session. On 2026-09-12 a 2 h 23 m run ended on `400 invalid_request_error:
+        Could not process image`, and the harness was right that a 400 is not
+        survivable by WAITING -- the same bytes get the same answer forever -- but
+        wrong that it is not survivable at all. The bad bytes are sitting in the
+        thread, and a thread is a thing this process owns and can edit. Take the image
+        out and the very next call goes through.
+
+        EVERY image goes, not the guilty one, because the API does not say which it
+        objected to and guessing wrong means another refused call. Images are the
+        cheapest thing in a thread to lose: the file is still on the instance and the
+        path is still in the text beside it, so the model can look again on purpose.
+        What it must NOT do is silently lose the knowledge that it ever looked, which
+        is why each one leaves a sentence behind rather than a hole.
+
+        `images.incomplete` (images.py) is the other half of the same fix and the one
+        that should keep this from being needed: it stops a half-written figure being
+        attached in the first place. This is the backstop for every other reason an
+        image can be refused, including the ones nobody has met yet.
+        """
+        dropped = 0
+
+        def clean(content: Any) -> Any:
+            nonlocal dropped
+            if not isinstance(content, list):
+                return content
+            out = []
+            for block in content:
+                kind = block.get("type") if isinstance(block, dict) else getattr(block, "type", None)
+                if kind == "image":
+                    dropped += 1
+                    out.append({
+                        "type": "text",
+                        "text": "[an image was here. The model API refused it, so it was "
+                                "removed to keep this session alive. The file is still on "
+                                "the instance: read the path again to look at it.]",
+                    })
+                elif kind == "tool_result" and isinstance(block, dict):
+                    out.append({**block, "content": clean(block.get("content"))})
+                else:
+                    out.append(block)
+            return out
+
+        first = None
+        for at, message in enumerate(self.messages):
+            if isinstance(message, dict):
+                before = dropped
+                message["content"] = clean(message.get("content"))
+                if dropped > before and first is None:
+                    first = at
+        if first is not None:
+            self._unbind_after(first)
+        return dropped
+
+    def _unbind_after(self, index: int) -> None:
+        """Take the reasoning blocks out of every assistant turn after `index`, the
+        first message about to be rewritten.
+
+        A thinking block is bound to everything before it -- the system prompt, the
+        tool list and the messages. Measured against Anthropic's API with the binding
+        checked strictly (`prefix_mismatch_behavior: "error"`, which is how Bedrock
+        behaves): a thread replayed with an earlier user message edited is refused,
+        `400 messages.1.content.0: Invalid signature in thinking block. The block is
+        bound to a different conversation`, and the same thread with that block taken
+        out goes through. Image eviction and `drop_images` both rewrite an earlier
+        message, so the turns after it lose their reasoning blocks -- the words and
+        tool calls beside them stay, which is what carries the reasoning forward.
+        Blocks before the rewritten message keep their prefix and are kept."""
+        from . import switch
+
+        switch.strip_thinking(self.messages[index + 1:])
+
     def restart(self, blurb: str) -> None:
-        """Begin a fresh thread from a factual situation blurb."""
+        """Begin a fresh thread from a factual situation blurb.
+
+        Everything the old thread carried goes here, and `ctx.echoes` is part of what
+        it carried. The echo table maps a digest to the call whose bytes are still in
+        the conversation, and it is the one piece of thread state that does not live
+        on the thread: `ToolContext` is built once a session and never replaced. Left
+        standing, every digest recorded before the reset stays matchable after it, so
+        the first thing a freshly briefed model does -- go back and read the solver
+        log it no longer remembers -- is answered with a pointer to a call that is no
+        longer in any conversation, and asking again returns the same pointer for the
+        rest of the session.
+        """
         self.messages = []
         self.context_tokens = 0
+        self.ctx.echoes.clear()
         self.brief(blurb)
 
     # -- capture ---------------------------------------------------------------
@@ -442,6 +1128,8 @@ class Loop:
         seq = self.store.append_message(role, content)
         if self.capture:
             self.capture.message(seq, role, content)
+        if self.recorder is not None:
+            self.recorder.message(role, content)
 
 
 TICK_EVERY_S = 10.0
@@ -490,6 +1178,21 @@ def _image_bytes(blocks: list) -> int:
     return total
 
 
+def forwarded_note(note: str = "") -> str:
+    """The harness's line beside words the side chat passed on (`Loop.forward`).
+
+    The words themselves arrive as the person's, untouched, exactly as a message typed
+    mid-turn does; this says only how they came, so they are not read as an answer to
+    whatever was last asked. The side chat's own note, when it wrote one, is quoted
+    here and labelled as the side chat's -- never folded into the person's words."""
+    line = ("The person's message just above was asked as a side question (/btw), "
+            "answered apart from this conversation, and passed on to you in their own "
+            "words.")
+    if note and note.strip():
+        line += f" The side chat's own note, not the person's: {note.strip()}"
+    return line
+
+
 def _as_operator_text(text: Any) -> str:
     body = text if isinstance(text, str) else json.dumps(text, default=str)
     return f"[from the harness, not the user]\n{body}"
@@ -509,6 +1212,17 @@ def _summarize(tool_input: Any, width: int = 100) -> str:
         text = str(tool_input)
     text = " ".join(text.split())
     return text if len(text) <= width else text[: width - 3] + "..."
+
+
+def _question(name: str, tool_input: dict[str, Any], home: str) -> tuple[str, str]:
+    """The title and detail a gated call is put to the person with: what would run."""
+    if name == "job_start":
+        cmd = str(tool_input.get("cmd") or "")
+        label = tool_input.get("name") or (cmd.splitlines()[0][:60] if cmd else "")
+        return f"Start a job: {label}", f"cmd: {cmd}\ncwd: {tool_input.get('cwd') or home}"
+    # Only `job_start` is gated (`modes.COMPUTE_TOOLS`); this is the fallback for a
+    # tool that is gated later without a question of its own being written for it.
+    return f"Run {name}", _summarize(tool_input, width=400)
 
 
 ToolFactory = Callable[[], ToolContext]

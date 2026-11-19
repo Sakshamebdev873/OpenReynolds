@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from openreynolds.config import CONTEXT_WINDOW_TOKENS, Config
@@ -79,6 +81,78 @@ def test_refusal_stops_without_appending_a_turn(loop):
     assert [m["role"] for m in loop.messages] == ["user"]
 
 
+def refusal(explanation="This request was blocked as it seems to violate ..."):
+    turn = message([], stop_reason="refusal")
+    turn.model = "claude-opus-5"
+    turn.stop_details = SimpleNamespace(type="refusal", category="frontier_llm",
+                                        explanation=explanation)
+    return turn
+
+
+def test_a_refused_turn_is_answered_by_the_fallback_and_the_session_stays_on_it(loop):
+    """The live failure of 2026-10-01: Opus declined a CFD request under the "reverse
+    engineering or duplicating model outputs" rule, and the session stopped with the
+    sentence on screen. The vendor's remedy is the same request on another Claude
+    model, and to stay there for the rest of the conversation."""
+    answered = message([text_block("The mesh has 94,321 cells.")])
+    answered.model = "claude-sonnet-5"
+    fake = install(loop, [refusal(), answered])
+    loop.say("how many cells?")
+
+    response = loop.run()
+
+    assert response.stop_reason == "end_turn" and response.model == "claude-sonnet-5"
+    assert [m["role"] for m in loop.messages] == ["user", "assistant"]
+    assert [c["model"] for c in fake.calls] == ["claude-opus-5", "claude-sonnet-5"]
+    # The session moved with the answer, and says so.
+    assert loop.cfg.model == "claude-sonnet-5"
+    assert loop.store.session.model == "claude-sonnet-5"
+    said = "\n".join(loop.view.notices)
+    assert "claude-opus-5 (frontier_llm: This request was blocked" in said
+    assert "claude-sonnet-5 answered it instead" in said
+    assert "stays on claude-sonnet-5" in said and "/model claude-opus-5" in said
+    # And the next turn asks Sonnet first, once, rather than paying for another refusal.
+    fake._responses = [answered]
+    loop.say("and the volume?")
+    loop.run()
+    assert fake.calls[-1]["model"] == "claude-sonnet-5" and len(fake.calls) == 3
+
+
+def test_a_refused_turn_strips_the_declined_models_reasoning_from_the_thread(loop):
+    """What `switch.apply` does on any model change: a thinking block carries a
+    signature only the model that wrote it accepts."""
+    first = message([SimpleNamespace(type="thinking", thinking="hmm", signature="sig"),
+                     text_block("done")])
+    answered = message([text_block("ok")])
+    answered.model = "claude-sonnet-5"
+    install(loop, [first, refusal(), answered])
+    loop.say("go")
+    loop.run()
+    loop.say("again")
+    loop.run()
+
+    kinds = [getattr(b, "type", None) for b in loop.messages[1]["content"]]
+    assert "thinking" not in kinds and "text" in kinds
+
+
+def test_when_the_whole_chain_declines_the_notice_names_every_model(loop):
+    second = refusal("declined")
+    second.model = "claude-sonnet-5"
+    second.stop_details.category = "general_harms"
+    fake = install(loop, [refusal(), second])
+    loop.say("something")
+
+    response = loop.run()
+
+    assert response.stop_reason == "refusal"
+    assert [m["role"] for m in loop.messages] == ["user"]
+    assert [c["model"] for c in fake.calls] == ["claude-opus-5", "claude-sonnet-5"]
+    assert loop.cfg.model == "claude-opus-5"  # nothing answered, nothing moved
+    notice = loop.view.notices[-1]
+    assert notice.startswith("Every model declined this request")
+    assert "claude-opus-5 (frontier_llm" in notice and "claude-sonnet-5 (general_harms: declined)" in notice
+
+
 def test_facts_use_the_operator_channel_after_a_user_turn(loop):
     loop.say("go")
     loop.inform("job solve exited, exit_code=0")
@@ -144,6 +218,60 @@ def test_refresh_warns_the_model_then_starts_a_fresh_thread(loop):
     assert len(loop.messages) == 1
     assert loop.messages[0]["role"] == "user"
     assert "study s1" in loop.messages[0]["content"]
+
+
+def tool_result(loop, tool_use_id: str) -> str:
+    """What went back for one tool call, wherever in the thread it ended up."""
+    for msg in loop.messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("tool_use_id") == tool_use_id:
+                return block["content"]
+    raise AssertionError(f"no tool result for {tool_use_id}")
+
+
+@pytest.fixture
+def roomy_loop(backend, store, view):
+    """A loop whose output cap is above the echo threshold, so a large repeat is
+    actually large by the time it is compared."""
+    ctx = ToolContext(backend=backend, store=store, max_output=50_000)
+    return Loop(Config(llm_api_key="test-key", model="claude-opus-5"), ctx, store, view)
+
+
+def test_a_repeat_after_a_refresh_gets_the_bytes_and_not_a_pointer(roomy_loop, backend):
+    """The echo pointer says the bytes are still in this conversation. A refresh
+    empties the conversation, and `ctx.echoes` outlived it -- so a study long enough
+    to refresh, which is any study worth running, answered the model's first re-read
+    on the far side with a reference to a call that was no longer there. It never
+    recovered: asking again matched the same stale digest."""
+    log = "Solving for Ux, Initial residual = 1e-04\n" * 140   # ~5.6 KB
+    backend.files["/work/log.simpleFoam"] = log.encode()
+    read = {"path": "/work/log.simpleFoam"}
+
+    install(roomy_loop, [
+        message([tool_block("read_file", read, "tu1")], stop_reason="tool_use"),
+        message([text_block("read it")]),
+        message([text_block("noted")]),          # the turn refresh() runs before resetting
+        message([tool_block("read_file", read, "tu2")], stop_reason="tool_use"),
+        message([text_block("read it again")]),
+    ])
+
+    roomy_loop.say("read the log")
+    roomy_loop.run()
+    assert log in tool_result(roomy_loop, "tu1")
+
+    roomy_loop.refresh("study s1 on instance i1. Jobs still running: none.")
+
+    roomy_loop.say("read the log again")
+    roomy_loop.run()
+    again = tool_result(roomy_loop, "tu2")
+
+    assert "identical, byte for byte" not in again, (
+        "the thread that pointer indexes into was emptied by the refresh"
+    )
+    assert log in again
 
 
 def test_every_turn_is_mirrored_locally(loop, store):
@@ -241,6 +369,293 @@ def test_nothing_typed_leaves_the_message_untouched(loop):
     assert all(b["type"] == "tool_result" for b in loop.messages[2]["content"])
 
 
+# -- a held job_check and the inbox --------------------------------------------
+#
+# `job_check(wait_s=...)` asks the loop the same question `mesh_wait` does -- has the
+# person said something the model has not seen (`Loop.heard`) -- through the session's
+# real drain. Measured in production (study 20260921-033019-e1b4): with a put-back line
+# in the reader's queue, `job_check` too answered `[waited 0s] [the user said something]`
+# at 03:37:38, 03:44:39, 03:46:18 and 03:50:27, with no words following; the run beside
+# it (20260921-033356-076b) held its `job_check(wait_s=120..300)` waits in full.
+
+
+def _job_wired(loop, backend, store, view, reader, ends_after_polls=None):
+    from openreynolds import cli
+    from openreynolds.backend.base import JobStatus
+    from openreynolds.browse import Browser
+
+    loop.interject = lambda: cli._typed_while_working(
+        loop, view, Browser(backend, store), store, reader)
+    loop.ctx.on_wait_input = loop.heard
+    loop.ctx.on_leaving = lambda: loop.leaving
+    job_id = backend.job_start("simpleFoam", name="solve")
+    store.record_job(job_id, cmd="simpleFoam", name="solve")
+    polls = {"n": 0}
+    real = backend.job_status
+
+    def counting(jid):
+        polls["n"] += 1
+        if ends_after_polls is not None and polls["n"] >= ends_after_polls:
+            backend.jobs[jid] = JobStatus(job_id=jid, name="solve", status="exited",
+                                          exit_code=0, end_reason="completed", log_size=0)
+        return real(jid)
+
+    backend.job_status = counting
+    return job_id, polls
+
+
+def _transcript(store):
+    """(role, content) of every line in the study's messages.jsonl."""
+    import json
+
+    return [
+        (row["role"], row["content"])
+        for row in (
+            json.loads(line)
+            for line in (store.dir / "messages.jsonl").read_text(encoding="utf-8").strip().splitlines()
+        )
+    ]
+
+
+# -- End pressed mid-turn ---------------------------------------------------------
+#
+# The web's End button sends `/exit` into the session's inbox; typed, `/exit` and `/quit`
+# are the same command, and an EOF (the interface's ctrl+C, a closed stdin) is the same
+# leaving. Met by the drain mid-turn, all of them used to be put back for the prompt and
+# honoured only when the turn ended on its own. Measured in production (study
+# 20260921-033019-e1b4): End pressed at 03:33:40, in a turn that went on to 04:10:46 --
+# thirty-seven minutes of `bash sleep` and held waits for a person who had left -- and
+# the session ended 27 s after the turn did. Now the turn ends at its next safe point.
+
+
+@pytest.mark.parametrize("leaving", ["/exit", "/quit", None], ids=["exit", "quit", "eof"])
+def test_end_pressed_during_a_held_job_check_ends_the_wait_and_the_turn(
+    loop, backend, store, view, monkeypatch, leaving
+):
+    """The wait returns at once saying the person ended the session; the model is not
+    asked again; the transcript carries one line, in the harness's voice, saying the
+    turn was ended by the person; the line itself is still there for the prompt."""
+    import threading
+    import time
+
+    from conftest import ScriptedReader
+
+    monkeypatch.setattr("openreynolds.tools.JOB_WAIT_POLL_S", 0.01)
+    reader = ScriptedReader([])
+    job_id, polls = _job_wired(loop, backend, store, view, reader)
+    fake = install(loop, [
+        message([tool_block("job_check", {"job_id": job_id, "wait_s": 30})], stop_reason="tool_use"),
+        message([text_block("the solve is done")]),
+    ])
+    threading.Timer(0.3, lambda: reader._lines.append(leaving)).start()
+
+    loop.say("watch it")
+    began = time.monotonic()
+    response = loop.run()
+    elapsed = time.monotonic() - began
+
+    assert 0.25 <= elapsed < 5, "held until End was pressed, then answered at once"
+    assert polls["n"] >= 1 and backend.jobs[job_id].status == "running"
+    assert len(fake.calls) == 1, "the model was not asked again"
+    assert response.stop_reason == "tool_use", "the turn that was in flight is the one returned"
+    assert loop.leaving is True
+
+    results = loop.messages[2]["content"]
+    assert [b["type"] for b in results] == ["tool_result", "text"]
+    out = results[0]["content"]
+    assert "status=running" in out and "[waited" in out
+    assert "the person ended the session, so this answered early" in out
+    assert "the person wrote" not in out, "nothing was said for the model"
+    assert results[1]["text"] == f"[from the harness, not the user]\n{loop_mod.LEFT_MID_TURN}"
+    assert loop.messages[-1] is loop.messages[2], "the thread ends on the results, whole"
+
+    transcript = _transcript(store)
+    assert [role for role, _ in transcript] == ["user", "assistant", "tool", "event"]
+    assert transcript[-1][1] == loop_mod.LEFT_MID_TURN, "one line, the harness's"
+    assert any("ended mid-turn" in n for n in view.notices)
+    assert reader.poll() == leaving, "still there for whoever reads next, as before"
+
+
+def test_leaving_stops_the_cad_desk_at_its_next_cell(loop):
+    """The desk this replaced was stopped when the person left (#43); the CAD desk that
+    took its place holds the turn for up to its whole budget, so it has to be too. Its
+    budgets are read at every lap (`cad.agent`), which is where zero lands."""
+    desk = type("Desk", (), {"max_steps": 12, "max_seconds": 900.0})()
+    loop.ctx.cad = desk
+
+    loop.leave()
+
+    assert loop.leaving is True
+    assert (desk.max_steps, desk.max_seconds) == (0, 0.0)
+
+
+def test_words_typed_in_the_same_breath_as_end_ride_along_but_are_not_answered(
+    loop, backend, store, view, monkeypatch
+):
+    """"That's enough, thanks" and then End, in one drain: the words are delivered and
+    recorded like any interjection, but the wait's note says the person left -- not
+    "answer them, then call again", which nobody would do -- and no turn follows."""
+    import threading
+
+    from conftest import ScriptedReader
+
+    monkeypatch.setattr("openreynolds.tools.JOB_WAIT_POLL_S", 0.01)
+    reader = ScriptedReader([])
+    job_id, _polls = _job_wired(loop, backend, store, view, reader)
+    fake = install(loop, [
+        message([tool_block("job_check", {"job_id": job_id, "wait_s": 30})], stop_reason="tool_use"),
+        message([text_block("you're welcome")]),
+    ])
+    threading.Timer(0.3, lambda: reader._lines.extend(["that's enough, thanks", "/exit"])).start()
+
+    loop.say("watch it")
+    loop.run()
+
+    assert len(fake.calls) == 1
+    results = loop.messages[2]["content"]
+    assert [b["type"] for b in results] == ["tool_result", "text", "text"]
+    out = results[0]["content"]
+    assert "the person ended the session, so this answered early" in out
+    assert "the person wrote" not in out and "call job_check again" not in out
+    assert results[1]["text"] == "that's enough, thanks"
+    assert results[2]["text"].endswith(loop_mod.LEFT_MID_TURN)
+    assert view.interjections == ["that's enough, thanks"]
+    assert [role for role, _ in _transcript(store)] == ["user", "assistant", "tool", "user", "event"]
+
+
+def test_end_pressed_between_two_ordinary_tool_calls_makes_no_further_call(
+    loop, backend, store, view
+):
+    """A `bash` in flight when End is pressed finishes and its result is recorded; the
+    call after it in the same batch is not started and says so; the model is not asked
+    for the next batch."""
+    from conftest import ScriptedReader
+    from openreynolds import cli
+    from openreynolds.browse import Browser
+
+    reader = ScriptedReader([])
+    loop.interject = lambda: cli._typed_while_working(
+        loop, view, Browser(backend, store), store, reader)
+    real = backend.exec
+
+    def pressed_end_during(cmd, *args, **kwargs):
+        # End arrives while the first command runs: it is in the inbox by the time
+        # the drain runs before the second call.
+        if cmd == "sleep 60; ls mesh":
+            reader._lines.append("/exit")
+        return real(cmd, *args, **kwargs)
+
+    backend.exec = pressed_end_during
+    fake = install(loop, [
+        message([tool_block("bash", {"cmd": "sleep 60; ls mesh"}, "tu_1"),
+                 tool_block("bash", {"cmd": "tail log.pisoFoam"}, "tu_2")],
+                stop_reason="tool_use"),
+        message([tool_block("bash", {"cmd": "sleep 115"}, "tu_3")], stop_reason="tool_use"),
+        message([text_block("done")]),
+    ])
+
+    loop.say("pace it")
+    loop.run()
+
+    assert backend.execs == ["sleep 60; ls mesh"], "the call in flight ran; nothing after it"
+    assert len(fake.calls) == 1, "no further turn"
+    results = loop.messages[2]["content"]
+    assert [b["type"] for b in results] == ["tool_result", "tool_result", "text"]
+    assert results[0]["tool_use_id"] == "tu_1" and "exit_code" in results[0]["content"]
+    assert results[1] == {"type": "tool_result", "tool_use_id": "tu_2",
+                          "content": loop_mod.NOT_RUN_LEFT, "is_error": True}
+    assert loop_mod.LEFT_MID_TURN in results[2]["text"]
+    assert [name for name, _ in view.tools] == ["bash", "bash"], "the person sees both calls"
+    assert view.tool_errors == [loop_mod.NOT_RUN_LEFT]
+
+    recorded = [content for role, content in _transcript(store) if role == "tool"]
+    assert [r["error"] for r in recorded] == [False, True]
+    assert recorded[1]["output"] == loop_mod.NOT_RUN_LEFT
+    assert [role for role, _ in _transcript(store)][-1] == "event"
+
+
+def test_end_pressed_mid_turn_ends_the_session_loop_without_another_prompt(
+    loop, backend, store, view, monkeypatch
+):
+    """Through `_run_interactive`: the turn stops, and the session loop returns to the
+    close-down at once -- no second prompt, no reading of the put-back `/exit`, no wake
+    on the job that is still running."""
+    import threading
+
+    from conftest import ScriptedReader
+    from openreynolds import cli
+    from openreynolds.browse import Browser
+
+    monkeypatch.setattr("openreynolds.tools.JOB_WAIT_POLL_S", 0.01)
+    reader = ScriptedReader(["watch it"])
+    job_id, _polls = _job_wired(loop, backend, store, view, reader)
+    fake = install(loop, [
+        message([tool_block("job_check", {"job_id": job_id, "wait_s": 30})], stop_reason="tool_use"),
+        message([text_block("the solve is done")]),
+    ])
+    threading.Timer(0.3, lambda: reader._lines.append("/exit")).start()
+
+    cli._run_interactive(loop, backend, store, view, Browser(backend, store), reader)
+
+    assert len(fake.calls) == 1
+    # One watch and one prompt: the ones that took "watch it" while the job ran. After
+    # the turn, none -- the job still running was not watched for a person who left.
+    assert len(view.watched) == 1 and view.prompts == 1
+    assert store.live_jobs(), "it is still running: what becomes of it is the close-down's"
+    assert reader._lines == ["/exit"], "left in the reader, unread; nobody needs it now"
+
+
+def test_a_prompt_time_exit_is_unchanged(loop, backend, store, view):
+    """Typed when the model is waiting for input, `/exit` (and an EOF) ends the session
+    loop as before, without a turn and without the mid-turn machinery."""
+    from conftest import ScriptedReader
+    from openreynolds import cli, commands
+    from openreynolds.browse import Browser
+
+    fake = install(loop, [message([text_block("never said")])])
+    assert cli._apply(commands.parse("/exit"), loop, view, Browser(backend, store), store) is cli.QUIT
+
+    for lines in (["/exit"], ["/quit"], []):
+        cli._run_interactive(loop, backend, store, view, Browser(backend, store),
+                             ScriptedReader(lines))
+        assert loop.leaving is False, "nothing was running to stop"
+    assert fake.calls == [] and loop.messages == []
+    assert view.prompts == 3, "one prompt each, answered by leaving"
+    assert view.notices == [], "nothing to say about a turn: there was none"
+
+
+def test_a_held_job_check_ends_on_words_for_the_model_and_hands_them_over(
+    loop, backend, store, view, monkeypatch
+):
+    """A message pending as the wait begins ends it at once, once; the words are in
+    the same message as the result, and the result says where to find them."""
+    import time
+
+    from conftest import ScriptedReader
+
+    monkeypatch.setattr("openreynolds.tools.JOB_WAIT_POLL_S", 0.01)
+    reader = ScriptedReader(["is it converging?"])
+    job_id, _polls = _job_wired(loop, backend, store, view, reader)
+    install(loop, [
+        message([tool_block("job_check", {"job_id": job_id, "wait_s": 30})], stop_reason="tool_use"),
+        message([text_block("residuals are falling")]),
+    ])
+
+    loop.say("watch it")
+    began = time.monotonic()
+    loop.run()
+
+    assert time.monotonic() - began < 5, "it did not sit out the wait"
+    results = loop.messages[2]["content"]
+    assert [b["type"] for b in results] == ["tool_result", "text"]
+    out = results[0]["content"]
+    assert "[waited 0s]" in out
+    assert "the person wrote, so this answered early" in out
+    assert "call job_check again -- the job is still running" in out
+    assert results[1]["text"] == "is it converging?"
+    assert loop._typed == [], "delivered, so it cannot end the next wait as well"
+
+
 # -- the loop has visible joints ------------------------------------------------
 
 
@@ -312,7 +727,7 @@ def test_a_tool_that_raises_still_leaves_the_bar_idle(ctx, store, view, monkeypa
     loop.progress = Bar()
     install(loop, [message([tool_block("bash", {"cmd": "x"})], stop_reason="tool_use")])
 
-    def explode(ctx, name, args):
+    def explode(ctx, name, args, call_id=None):
         raise RuntimeError("boom")
 
     monkeypatch.setattr("openreynolds.loop.dispatch", explode)
@@ -452,3 +867,42 @@ def test_folding_leaves_every_other_message_byte_identical(ctx, store, view):
 
     folded = loop._fold_system({"role": "system", "content": "a fact"})
     assert folded["role"] == "user" and "a fact" in folded["content"]
+
+
+def test_rewriting_an_earlier_message_takes_the_reasoning_out_of_every_turn_after_it(
+    ctx, store, view, monkeypatch
+):
+    """A thinking block is bound to everything before it. Measured with the binding
+    checked strictly (Anthropic's `prefix_mismatch_behavior: "error"`, Bedrock's
+    behaviour): an earlier message edited, the block after it is a 400; the block taken
+    out, the request goes through. Image eviction edits an earlier message."""
+    from types import SimpleNamespace
+
+    from openreynolds import loop as loop_mod
+
+    monkeypatch.setattr(loop_mod, "LIVE_IMAGE_BUDGET", 0)
+    loop = Loop(Config(llm_api_key="k", model="claude-opus-5-5"), ctx, store, view)
+
+    def thought(name):
+        return SimpleNamespace(type="thinking", thinking=name, signature="sig")
+
+    def picture(tid):
+        return {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tid, "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "x" * 10}},
+            {"type": "text", "text": f"render {tid}"}]}]}
+
+    use = lambda tid: SimpleNamespace(type="tool_use", id=tid, name="read_file", input={})
+    loop.messages = [
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": [thought("before"), use("a")]},
+        picture("a"),
+        {"role": "assistant", "content": [thought("after"), use("b")]},
+        picture("b"),
+    ]
+
+    loop._evict_old_images(keep=1)
+
+    assert loop.messages[2]["content"][0]["content"].startswith("[image no longer in context")
+    kinds = lambda m: [getattr(b, "type", None) or b.get("type") for b in m["content"]]
+    assert kinds(loop.messages[1]) == ["thinking", "tool_use"], "its prefix did not move"
+    assert kinds(loop.messages[3]) == ["tool_use"], "its prefix did"

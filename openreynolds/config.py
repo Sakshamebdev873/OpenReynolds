@@ -13,12 +13,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .levels import DEFAULT_AMBITION, DEFAULT_CONSENT, normalise as normalise_level
-from .llm.presets import FALLBACK_CONTEXT_WINDOW, preset_for
+from .llm.presets import (
+    FALLBACK_CONTEXT_WINDOW,
+    PRESETS,
+    REYNOLDS,
+    REYNOLDS_SUCCESSORS,
+    context_window_for,
+    desk_model_for,
+    family_for,
+    preset_for,
+    serves,
+    successor,
+)
 
 DEFAULT_FOAMD_URL = "https://api.tryreynolds.com"
 """Where the workspace service lives unless told otherwise. A key from
 `openreynolds login` belongs to whichever service issued it, so the two are saved
 together."""
+
+ACCOUNT_PAGE_URL = "https://app.tryreynolds.com"
+"""The web app's account page: plans, credits, overage and the card (Update card).
+Named wherever a refusal sends someone to fix their billing."""
 
 DEFAULT_MODEL = "claude-opus-5"
 DEFAULT_EFFORT = "high"
@@ -54,11 +69,26 @@ was the single largest cost of a study (thirty-odd wakes across one solve, for
 nothing the progress bar was not already showing); ten minutes keeps the
 narration and drops that bill by an order of magnitude. Zero turns it off."""
 
+DEFAULT_WORKSPACE_ETA_S = 30.0
+"""How long a workspace usually takes to come up, as said to the model at the start
+of a session that is running ahead of its workspace (`cli.session`, the briefing).
+
+A hint, not a measurement: the session cannot know what is behind the service, and
+the number is only ever said as "usually about". An embedder that knows its fleet
+sets `OPENREYNOLDS_WORKSPACE_ETA_S`; thirty seconds is between a warm pool and a cold
+machine."""
+
 DEFAULT_DESK_MODEL = "claude-haiku-4-5"
-"""The front-desk model: a second, cheap agent that answers the user while the main
-agent is busy (`desk.py`). Haiku is ~5x cheaper than the Opus main model and fast
-enough to reply in seconds. Uses the same BYOK key. `OPENREYNOLDS_DESK_MODEL` overrides;
-`OPENREYNOLDS_DESK=0` turns it off entirely."""
+"""The model the front desk used to answer with: a second, cheap agent that replied to
+every message typed while the main agent was busy. That desk is gone (`desk.py` says
+why), and nothing in a session asks for this model any more.
+
+It is still read, written and switched like any other setting, on purpose. The hosted
+app stores a desk model beside every bring-your-own key and names one in the
+environment of every session it starts (`OPENREYNOLDS_DESK_MODEL`); config files on
+people's machines carry `desk_model`; and the presets use it to keep the cheap models
+out of the list `/model` offers (`presets.models_for`). Removing it here first would
+turn each of those into a setting this side refuses. It goes when they have."""
 
 CONTEXT_WINDOW_TOKENS = 1_000_000
 CONTEXT_REFRESH_FRACTION = 0.8
@@ -73,9 +103,87 @@ _CONFIG_KEYS = (
     "desk_model",
     "effort",
     "context_window",
+    "mode",
     "ambition",
     "consent",
 )
+
+
+
+class ConfigUnreadable(Exception):
+    """The config file is there but cannot be read as settings."""
+
+
+def _stored() -> dict[str, object]:
+    """The config file as written, nothing from the environment. {} when there is no
+    file; `ConfigUnreadable` when there is one that cannot be read."""
+    path = config_path()
+    try:
+        stored = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ConfigUnreadable(f"{path}: {exc}") from exc
+    if not isinstance(stored, dict):
+        raise ConfigUnreadable(f"{path}: not a settings object")
+    return stored
+
+
+def stored_service_key() -> tuple[str, str]:
+    """(service url, service key) as the config file has them; empty strings for
+    either that is not there. Raises `ConfigUnreadable`."""
+    stored = _stored()
+    return str(stored.get("foamd_url") or ""), str(stored.get("foamd_api_key") or "")
+
+
+_CHOSEN_BY = ("OPENREYNOLDS_PROVIDER", "OPENREYNOLDS_MODEL", "OPENREYNOLDS_LLM_BASE_URL",
+              "OPENREYNOLDS_LLM_API_KEY")
+
+
+def model_chosen() -> bool:
+    """Whether anyone chose whose model this machine uses: the config file names a
+    provider, a model, an endpoint or a key, or the environment does -- any vendor's
+    own key variable included (`OPENAI_API_KEY` with no provider set is still someone
+    bringing their own model). Raises `ConfigUnreadable`."""
+    names = set(_CHOSEN_BY) | {p.key_env for p in PRESETS.values() if p.key_env}
+    if any(os.environ.get(name) for name in names):
+        return True
+    stored = _stored()
+    return any(stored.get(key) for key in
+               ("provider", "model", "llm_base_url", "llm_api_key", "anthropic_api_key"))
+
+
+def forget_service_key() -> bool:
+    """Remove the service key from the config file, leaving every other setting as it
+    was written (not as the environment has it now). Whether the file named one.
+    Written whole or not at all. Raises `ConfigUnreadable`."""
+    stored = _stored()
+    if "foamd_api_key" not in stored:
+        return False
+    had = bool(stored.pop("foamd_api_key"))
+    _write_private(config_path(), json.dumps(stored, indent=2) + "\n")
+    return had
+
+
+def _write_private(path: Path, text: str) -> None:
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, stat.S_IRUSR | stat.S_IWUSR)
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(text)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+def _seconds_or(text: str | None, default: float) -> float:
+    """A non-negative number of seconds from an environment variable, or `default`
+    for anything that is not one. A hint about timing is not worth refusing to start
+    over."""
+    try:
+        value = float(text) if text else default
+    except ValueError:
+        return default
+    return value if value >= 0 else default
 
 
 def preferences_path() -> Path:
@@ -118,9 +226,10 @@ class Config:
     """Where the model client points. `None` means the preset's endpoint, or the
     vendor's default for a bare family.
 
-    The `reynolds` preset ignores whatever is here: the service's own `/v1/llm` is
-    derived from `foamd_url` at run time rather than stored, so moving the service
-    moves the model with it and a stale URL in a config file cannot outlive it.
+    The `reynolds` preset ignores whatever is here: the service's own `/v1/llm` (Claude)
+    or `/v1/llm/v1` (GPT) is derived from `foamd_url` at run time rather than stored, so
+    moving the service moves the model with it and a stale URL in a config file cannot
+    outlive it.
     """
     context_window: int = 0
     """Tokens the model can hold in one thread; the loop refreshes at a fraction of it.
@@ -133,6 +242,9 @@ class Config:
     llm_timeout_s: float = DEFAULT_LLM_TIMEOUT_S
     mirror_interval_s: float = DEFAULT_MIRROR_INTERVAL_S
     narrate_every_s: float = DEFAULT_NARRATE_EVERY_S
+    workspace_eta_s: float = DEFAULT_WORKSPACE_ETA_S
+    """Seconds a workspace usually takes to come up, told to the model while it waits
+    for one (`OPENREYNOLDS_WORKSPACE_ETA_S`). See `DEFAULT_WORKSPACE_ETA_S`."""
     capture: bool = True
     """Whether transcripts are uploaded to the workspace service as the study runs.
 
@@ -141,24 +253,61 @@ class Config:
     a flag has to be remembered every time, and the place it is most likely to be
     forgotten is the scheduled run nobody is watching."""
     desk: bool = True
-    """Whether the front-desk agent runs. It answers the user while the main agent is
-    mid-turn -- the difference between a message heard in seconds and one that waits
-    out a five-minute solve."""
+    """Whether `/btw <question>` is answered as a side question (`desk.SideChat`): the
+    main agent's last request sent once more with the question appended, answered
+    apart from the conversation and never added to it. `OPENREYNOLDS_DESK=0` turns it
+    off, and a `/btw` question is then answered with how to say it to the agent
+    instead. It used to switch the front desk, which answered every message typed
+    mid-turn with a cheaper model; nothing answers those automatically now."""
     desk_model: str = DEFAULT_DESK_MODEL
     mesher_model: str = ""
-    """The model the mesh desk (`mesher/`) builds geometry with. Empty means the main
-    model: building the shape is the work, not the narration."""
+    """The model the CAD desk (`cad/`) builds geometry with. Empty means the preset's
+    CAD model where it names one, else the main model: building the shape is the
+    work, not the narration. On `reynolds` it may be either family; the desk's client
+    is built for whichever it is.
+    `OPENREYNOLDS_CAD_MODEL`, or `OPENREYNOLDS_MESHER_MODEL` as it was."""
     mesher_effort: str = "high"
-    """The effort the mesh desk reasons at, whatever the main loop's is. Placing an
+    """The effort the CAD desk reasons at, whatever the main loop's is. Placing an
     arc's end and a row's pitch is arithmetic the model gets right one time in six at
     medium, and the hosted app runs the main loop at medium.
-    `OPENREYNOLDS_MESHER_EFFORT` overrides."""
+    `OPENREYNOLDS_CAD_EFFORT`, or `OPENREYNOLDS_MESHER_EFFORT` as it was."""
+    mesh_tool: bool = True
+    """Whether the `cad` tool is offered at all (`OPENREYNOLDS_CAD_TOOL=0`, or
+    `OPENREYNOLDS_MESH_TOOL=0` as it was, takes it away). It exists to be measured
+    against: the argument that a slow natural-language sub-agent is a worse interface
+    than the bash the caller already has is settled by running the same prompt both
+    ways, not by preferring one."""
     mesher_max_steps: int = 0
-    """Commands the mesh desk may run in one call; 0 takes the default (30).
-    `OPENREYNOLDS_MESHER_MAX_STEPS`."""
+    """Cells the CAD desk may run in one call; 0 takes the default (30).
+    `OPENREYNOLDS_CAD_MAX_STEPS`, or `OPENREYNOLDS_MESHER_MAX_STEPS` as it was."""
     mesher_max_seconds: float = 0.0
     """Wall clock for one call; 0 takes the default (900 s).
-    `OPENREYNOLDS_MESHER_MAX_SECONDS`."""
+    `OPENREYNOLDS_CAD_MAX_SECONDS`, or `OPENREYNOLDS_MESHER_MAX_SECONDS` as it was."""
+    fallback_models: str = ""
+    """The models a request the vendor's safety classifier declines is retried on,
+    comma-separated and in order; `0` or `off` for none. Empty takes the preset's
+    chain (`llm.presets.fallbacks_for`: on `reynolds` the other model of the same
+    family the service meters, never the other family's; Opus and Sonnet on
+    `anthropic`; nothing elsewhere). `OPENREYNOLDS_FALLBACK_MODELS`, or
+    the config file's `fallback_models`."""
+    review_model: str = ""
+    """The model the independent geometry reviewer (`cad/review.py`) looks with. Empty
+    means the CAD desk's own model in a fresh thread -- still not the eyes that built
+    it. A different model is the interesting arm. `OPENREYNOLDS_REVIEW_MODEL`, or the
+    config file's `review_model`."""
+    cad_review: bool = True
+    """Whether the desk's finish is put past the reviewer at all
+    (`OPENREYNOLDS_CAD_REVIEW=0` turns the desk-side loop off; the standalone
+    `mesh_review` tool stays). The A/B knob, on the same argument as `mesh_tool`: the
+    claim that a second pair of eyes catches what `checkMesh` cannot is settled by
+    running the sweep both ways, not by preferring one."""
+    mode: str = "auto"
+    """How much the person wants to be consulted: `auto`, `partial` or `structured`
+    (`modes.py`). `OPENREYNOLDS_MODE` or the config file's `mode`; `--mode` for one
+    session. A value that is not a mode is ignored: a bad `OPENREYNOLDS_MODE` falls
+    through to the config file's, and a bad config-file value to `auto`. `openreynolds`
+    warns about a bad `OPENREYNOLDS_MODE` only. A resumed study keeps its stored mode
+    unless a valid one is given (`cli.session`)."""
     studies_dir: Path = field(default_factory=lambda: Path.cwd() / "studies")
     preferences: str = ""
     """The standing note from `preferences_path()`, or empty when there is none."""
@@ -183,6 +332,7 @@ class Config:
         # A preset's numbers apply when its endpoint is the one in use; an explicit
         # base URL pointing elsewhere is a vendor the table knows nothing about.
         at_preset = preset is not None and (not self.llm_base_url or self.llm_base_url == preset.base_url)
+        asked_window = self.context_window
         if not self.context_window:
             self.context_window = preset.context_window if at_preset else FALLBACK_CONTEXT_WINDOW
         if preset is not None and preset.name != "anthropic":
@@ -190,13 +340,29 @@ class Config:
                 self.model = preset.model
             if self.desk_model == DEFAULT_DESK_MODEL:
                 self.desk_model = preset.desk_model
+        if preset is not None and not self.mesher_model:
+            self.mesher_model = preset.cad_model
+        if preset is not None and preset.name == REYNOLDS:
+            self._settle_reynolds(asked_window)
+
+    def _settle_reynolds(self, asked_window: int) -> None:
+        """On `reynolds`, the desk speaks the main model's family, and the window is the
+        model's own (`MODEL_CONTEXT_WINDOWS`: GPT's priced 272K, Claude's million),
+        made smaller by `asked_window` (0 for none) but never larger. A Claude study
+        narrated through the Responses API would need a second client and a second
+        route for no gain, and a GPT desk model sent to the Messages API is a 4xx on
+        every line."""
+        if family_for(self.provider, self.desk_model) != family_for(self.provider, self.model):
+            self.desk_model = desk_model_for(self.provider, self.model)
+        own = context_window_for(self.model) or self.context_window
+        self.context_window = min(asked_window or own, own)
 
     def model_key_missing(self) -> str | None:
         """The name of the model-key setting that is absent, or `None` when the model
         can be reached: a key is present, an explicit endpoint stands in for one, or
         the preset (a local model) needs none."""
         preset = preset_for(self.provider)
-        if preset is not None and preset.name == "reynolds":
+        if preset is not None and preset.name == REYNOLDS:
             # The service key is the model key; `missing()` already asks for it.
             return None
         if self.llm_api_key or self.llm_base_url:
@@ -218,6 +384,24 @@ class Config:
         def pick(env: str, key: str, default: str = "") -> str:
             return os.environ.get(env) or str(stored.get(key) or "") or default
 
+        def pick_renamed(env: str, key: str, was_env: str, was_key: str,
+                         default: str = "") -> str:
+            """A setting whose name changed, read under either name.
+
+            The desk these five configure was called `mesher` and is called `cad`; the
+            settings are env-or-JSON only, so nothing persists them and nothing
+            migrates them -- a rename with no alias silently reverts every environment
+            that sets one to the default, which for `OPENREYNOLDS_MESH_TOOL=0` means
+            quietly turning the tool back on in the middle of the A/B that variable
+            exists to run. The new name wins where both are set, because that is the
+            one somebody typed most recently; otherwise the old name is honoured
+            exactly as it was. The dataclass field keeps its old name: renaming it
+            would rename the attribute the desk reads, and nothing is gained.
+            """
+            return (os.environ.get(env) or os.environ.get(was_env)
+                    or str(stored.get(key) or "") or str(stored.get(was_key) or "")
+                    or default)
+
         provider = pick("OPENREYNOLDS_PROVIDER", "provider", "anthropic").strip().lower()
         preset = preset_for(provider)
         # The vendor's own variable name works too (ANTHROPIC_API_KEY, OPENAI_API_KEY...),
@@ -229,11 +413,16 @@ class Config:
             or str(stored.get("anthropic_api_key") or "")
         )
         llm_base_url = pick("OPENREYNOLDS_LLM_BASE_URL", "llm_base_url") or None
+        # What was actually named, with no preset standing in for it. Re-asserted after
+        # construction below, where `__post_init__` can no longer swap it.
+        named_model = pick("OPENREYNOLDS_MODEL", "model")
+        named_desk = pick("OPENREYNOLDS_DESK_MODEL", "desk_model")
         window = pick("OPENREYNOLDS_CONTEXT_WINDOW", "context_window")
         max_output = os.environ.get("OPENREYNOLDS_MAX_TOOL_OUTPUT")
         timeout = os.environ.get("OPENREYNOLDS_LLM_TIMEOUT_S")
         mirror_every = os.environ.get("OPENREYNOLDS_MIRROR_INTERVAL_S")
         narrate_every = os.environ.get("OPENREYNOLDS_NARRATE_EVERY_S")
+        workspace_eta = os.environ.get("OPENREYNOLDS_WORKSPACE_ETA_S")
 
         try:
             preferences = preferences_path().read_text(encoding="utf-8").strip()
@@ -243,25 +432,45 @@ class Config:
         def switched_off(env: str) -> bool:
             return (os.environ.get(env) or "").strip().lower() in ("0", "false", "no", "off")
 
-        return cls(
+        from .modes import normalize as normal_mode
+
+        cfg = cls(
             preferences=preferences,
+            # Each source is checked on its own, so a bad OPENREYNOLDS_MODE falls through
+            # to the config file's mode rather than hiding it.
+            mode=normal_mode(os.environ.get("OPENREYNOLDS_MODE") or "")
+            or normal_mode(str(stored.get("mode") or ""))
+            or "auto",
             capture=not switched_off("OPENREYNOLDS_CAPTURE"),
             desk=not switched_off("OPENREYNOLDS_DESK"),
-            desk_model=pick(
-                "OPENREYNOLDS_DESK_MODEL", "desk_model",
-                preset.desk_model if preset else DEFAULT_DESK_MODEL,
-            ),
-            mesher_model=pick("OPENREYNOLDS_MESHER_MODEL", "mesher_model"),
-            mesher_effort=pick("OPENREYNOLDS_MESHER_EFFORT", "mesher_effort", "high"),
-            mesher_max_steps=int(pick("OPENREYNOLDS_MESHER_MAX_STEPS", "mesher_max_steps", 0) or 0),
-            mesher_max_seconds=float(pick("OPENREYNOLDS_MESHER_MAX_SECONDS", "mesher_max_seconds", 0) or 0),
+            desk_model=named_desk or (preset.desk_model if preset else DEFAULT_DESK_MODEL),
+            mesher_model=pick_renamed(
+                "OPENREYNOLDS_CAD_MODEL", "cad_model",
+                "OPENREYNOLDS_MESHER_MODEL", "mesher_model"),
+            mesher_effort=pick_renamed(
+                "OPENREYNOLDS_CAD_EFFORT", "cad_effort",
+                "OPENREYNOLDS_MESHER_EFFORT", "mesher_effort", "high"),
+            mesh_tool=str(pick_renamed(
+                "OPENREYNOLDS_CAD_TOOL", "cad_tool",
+                "OPENREYNOLDS_MESH_TOOL", "mesh_tool", "1")).strip().lower()
+            not in ("0", "false", "no", "off"),
+            mesher_max_steps=int(pick_renamed(
+                "OPENREYNOLDS_CAD_MAX_STEPS", "cad_max_steps",
+                "OPENREYNOLDS_MESHER_MAX_STEPS", "mesher_max_steps", 0) or 0),
+            mesher_max_seconds=float(pick_renamed(
+                "OPENREYNOLDS_CAD_MAX_SECONDS", "cad_max_seconds",
+                "OPENREYNOLDS_MESHER_MAX_SECONDS", "mesher_max_seconds", 0) or 0),
+            fallback_models=pick("OPENREYNOLDS_FALLBACK_MODELS", "fallback_models"),
+            review_model=pick("OPENREYNOLDS_REVIEW_MODEL", "review_model"),
+            cad_review=str(pick("OPENREYNOLDS_CAD_REVIEW", "cad_review", "1"))
+            .strip().lower() not in ("0", "false", "no", "off"),
             foamd_url=pick("FOAMD_URL", "foamd_url", DEFAULT_FOAMD_URL).rstrip("/"),
             foamd_api_key=pick("FOAMD_API_KEY", "foamd_api_key"),
             provider=provider,
             llm_api_key=llm_api_key,
             llm_base_url=llm_base_url,
             context_window=int(window) if window else 0,
-            model=pick("OPENREYNOLDS_MODEL", "model", preset.model if preset else DEFAULT_MODEL),
+            model=named_model or (preset.model if preset else DEFAULT_MODEL),
             effort=pick("OPENREYNOLDS_EFFORT", "effort", DEFAULT_EFFORT),
             ambition=pick("OPENREYNOLDS_AMBITION", "ambition", DEFAULT_AMBITION),
             consent=pick("OPENREYNOLDS_CONSENT", "consent", DEFAULT_CONSENT),
@@ -273,24 +482,70 @@ class Config:
             narrate_every_s=(
                 float(narrate_every) if narrate_every else DEFAULT_NARRATE_EVERY_S
             ),
+            workspace_eta_s=_seconds_or(workspace_eta, DEFAULT_WORKSPACE_ETA_S),
         )
+        # `__post_init__` swaps `claude-opus-5` for the preset's model, so that a
+        # provider named on its own arrives with a model that provider serves. A model
+        # named here is the opposite case, and the swap was eating it:
+        # `OPENREYNOLDS_PROVIDER=reynolds` with `OPENREYNOLDS_MODEL=claude-opus-5` --
+        # one of the two models that service metered while it fronted Claude, and what
+        # the hosted app's chooser sent for Opus -- loaded as Sonnet, silently, on every new
+        # session as well as on every resume. The default is above; what was asked for
+        # wins here.
+        if named_model:
+            cfg.model = named_model
+        if named_desk:
+            cfg.desk_model = named_desk
+        if preset is not None and preset.name == REYNOLDS:
+            # Until 2026-10 the service fronted Claude 5 alone, and `openreynolds config`
+            # saved the preset's ids into the file, so a machine set up then still names
+            # `claude-sonnet-5` here. The service now meters the 5.5 models instead, so
+            # a retired Claude id moves to its successor -- the person chose Claude, and
+            # stays on it -- and anything else it cannot serve goes to the default.
+            # Explicit names included: the hosted runner names a model on every session,
+            # and one it still names from the old list is a 4xx on every turn, not a
+            # choice worth honouring. The desk then follows the main model's family, and
+            # the window is that model's, made smaller but never larger
+            # (`_settle_reynolds`).
+            cfg.model = successor(provider, cfg.model)
+            if not serves(provider, cfg.desk_model):
+                cfg.desk_model = desk_model_for(provider, cfg.model)
+            if cfg.mesher_model and not serves(provider, cfg.mesher_model):
+                cfg.mesher_model = REYNOLDS_SUCCESSORS.get(cfg.mesher_model, preset.cad_model)
+            if cfg.review_model and not serves(provider, cfg.review_model):
+                cfg.review_model = REYNOLDS_SUCCESSORS.get(cfg.review_model, "")
+            cfg._settle_reynolds(int(window) if window else 0)
+        return cfg
 
     def save(self) -> Path:
         """Write the credential fields back, readable only by this user."""
         path = config_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {key: getattr(self, key) for key in _CONFIG_KEYS if getattr(self, key)}
+        # `mode` is written only when it is not the default, so a config file saved by
+        # someone who never chose a mode says nothing about modes.
+        payload = {
+            key: getattr(self, key)
+            for key in _CONFIG_KEYS
+            if getattr(self, key) and not (key == "mode" and self.mode == "auto")
+        }
         path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         if os.name != "nt":
             path.chmod(stat.S_IRUSR | stat.S_IWUSR)
         return path
 
-    def missing(self) -> list[str]:
-        """Which required settings are absent. LLM auth is bring-your-own-key."""
+    def missing(self, *, local: bool = False) -> list[str]:
+        """Which required settings are absent. LLM auth is bring-your-own-key.
+
+        A local workspace needs no service, so then only the model's key is required:
+        the open-source agent runs on a laptop with Docker and a key, and nothing else.
+        A model the service provides still needs the service's key, which
+        `model_key_missing` says."""
         gaps = []
-        if not self.foamd_url:
+        preset = preset_for(self.provider)
+        service = not local or (preset is not None and preset.name == REYNOLDS)
+        if service and not self.foamd_url:
             gaps.append("FOAMD_URL")
-        if not self.foamd_api_key:
+        if service and not self.foamd_api_key:
             gaps.append("FOAMD_API_KEY")
         key = self.model_key_missing()
         if key:

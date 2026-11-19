@@ -1,26 +1,67 @@
-"""The tool surface: eight tools, thin handlers, everything delegating to `Backend`.
+"""The tool surface: nine tools, thin handlers, everything delegating to `Backend`.
 
 There is no `run_gate`, no `amend_spec`, no `ask_user` — asking is just talking. Nothing
 here inspects what the model is doing or refuses it on policy grounds. The handlers cap
 output and report facts; that is the whole job.
 
-The eighth, `mesh`, delegates to the mesh desk (`mesher/`) rather than straight to the
+The eighth, `cad`, delegates to the CAD desk (`cad/`) rather than straight to the
 backend: it is the one tool whose work is a model loop of its own — an agent with one
-bash block a step, on the same workspace — and this module still knows nothing about
-how that loop reaches its model.
+python cell a step, in a kernel on the same workspace — and this module still knows
+nothing about how that loop reaches its model. What it does know is the one fact the
+desk cannot check for itself in time: whether the `geometry` file it was pointed at is
+there and readable. That is asked before the run starts, because a path that is wrong
+is worth a sentence rather than nine steps and a model bill.
+
+The ninth, `mesh_review`, is the desk's independent reviewer (`cad/review.py`) offered
+on its own: a fresh model that did not build the mesh looks at it from several views
+and says whether it is the shape that was asked for. It is a second opinion about any
+`constant/polyMesh` under the workspace -- one built with bash, one the desk returned,
+one somebody uploaded -- and it changes nothing. Like `cad`, it is in the list only when
+there is a reviewer to serve it.
+
+A tenth, `checkpoint`, is structured mode's (`modes.py`): there it puts a summary in
+front of the person and waits for their answer, the person asking to be consulted
+rather than the harness deciding to. It is in the list in every mode, because the list
+may not change mid-conversation, and outside structured mode it answers that
+checkpoints are structured mode's and puts nothing to anyone.
+
+`send_to_agent` is in every list and is not the main agent's at all. It is the side
+chat's (`desk.SideChat`): a `/btw` question is answered by the main agent's own last
+request sent again with the question appended, and that request reads the whole
+conversation from the prompt cache only if its tool list is this one, byte for byte. So
+the one tool the side chat needs of its own -- passing the person's words on -- is here
+from the first request of every session to the last, and called by the main agent it
+answers that it is for side questions. One short definition in a cached prefix costs a
+few hundred cache-read tokens a request; a tool list that differed between the two
+requests would cost the whole conversation at the uncached rate on every side question.
 """
 
 from __future__ import annotations
 
+import posixpath
 import re
+import shlex
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from . import images
-from . import trace
-from .progress import case_dir_from_cmd, parse_control_dict, phase_from_cmd
-from .backend.base import Backend, BackendError, EXEC_MAX_TIMEOUT_S, JobStatus, WORKSPACE_ROOT
+from . import ceiling, convergence, images
+from . import solvers, trace
+from .progress import (
+    case_dir_from_cmd,
+    felix_job_summary,
+    is_felix_solve,
+    parse_control_dict,
+    phase_from_cmd,
+)
+from .backend.base import (
+    Backend,
+    BackendError,
+    EXEC_MAX_TIMEOUT_S,
+    EXEC_SYNC_WINDOW_S,
+    JobStatus,
+    WORKSPACE_ROOT,
+)
 from .store import Store
 
 SLOW_COMMAND_S = 10.0
@@ -31,6 +72,25 @@ JOB_WAIT_MAX_S = 300
 
 JOB_WAIT_POLL_S = 5.0
 """How often a waiting `job_check` looks at the job."""
+
+INPUT_POLL_S = 1.0
+"""How often a held wait asks whether the person has written or left (`_hold`). A
+message typed while the agent waits is read within this, not within `JOB_WAIT_POLL_S`."""
+
+READ_TIMEOUT_S = 60.0
+"""How long `read_file` waits on the workspace for one file before saying so.
+
+The backend's own default is 300 s, and until 2026-09-07 it was *unbounded* -- one
+`stat` was watched sitting for over ten minutes. Measured on a contended workspace,
+two of three stats of a file another session was writing timed out at 40 s while the
+same file settled answered in 2.8 s, so a read that is going to be slow is usually
+going to be very slow, and the model is better told that in a minute than blocked for
+five. It reads again if it wants to; a tool call it cannot escape is the expensive
+part."""
+
+READ_ATTEMPTS = 2
+"""Retries inside one `read_file`. A contended read that failed twice inside a minute
+is a fact worth reporting, not one worth waiting out."""
 
 TAIL_HINT_BYTES = 4_000
 """How far back from the end a truncation marker points, so the offered offset lands on
@@ -49,12 +109,33 @@ class ToolContext:
     on_fetch: Callable[[list[Any]], None] | None = None
     """Called with the local paths `fetch` produced, for artifact capture."""
     on_wait_input: Callable[[], bool] | None = None
-    """Whether the user has said something not yet delivered, without taking it.
+    """Whether the person has said something for the model that it has not seen yet.
 
-    A waiting `job_check` ends early on it, so a person who speaks during a held
-    call is heard in seconds rather than when the wait runs out."""
+    A waiting `job_check` ends early on it, so a person who speaks
+    during a held call is heard in seconds rather than when the wait runs out. The
+    session loop answers it (`Loop.heard`): it drains the inbox as the loop does
+    between tool calls, answers commands on the spot, and holds the words for the
+    model to ride after this batch's results -- so what ended the wait is in the same
+    message as the result that says so, and a line that is nobody's to deliver to the
+    model (`/exit`, an EOF, a `/status`) ends nothing. It used to be the reader's
+    `pending()`, a peek at the queue, and a put-back `/exit` made every wait for the
+    rest of a turn answer at once with `waited 0s` (study 20260921-033019-e1b4)."""
+    on_leaving: Callable[[], bool] | None = None
+    """Whether the person has ended the session while this turn runs (`Loop.leaving`).
+
+    The other question a held `job_check` asks once a second, after
+    `on_wait_input`: a `/exit`, a `/quit` or an EOF met by the drain is nobody's to
+    deliver to the model, so it is not "heard" -- but it is the person leaving, and a
+    wait held for them is held for nobody. The wait returns at once, saying so, and
+    the loop ends the turn after this batch's results rather than at the model's next
+    reply. Measured before this (study 20260921-033019-e1b4): End pressed at 03:33:40
+    into a turn was honoured when the turn ended on its own, thirty-seven minutes
+    later. None when nobody is wired to answer, and then no wait ends on it."""
     cores: int | None = None
-    """What `nproc` reported, once it has been asked. See `_core_count`."""
+    """What `nproc` reported, once it has been asked: hardware threads. See `_core_count`."""
+    physical_cores: int | None = None
+    """Physical cores, from `lscpu`, asked in the same round trip as `cores`. Zero when
+    the machine would not say; then only the thread count is spoken of."""
     started: float = field(default_factory=time.monotonic)
     """When this session began.
 
@@ -84,20 +165,109 @@ class ToolContext:
     A render the model just examined is exactly the file the user wants on their
     machine right now, not at the next mirror cycle. The hook must not block and
     must not fail the read -- it is a nudge, and the picture matters more."""
-    mesher: Any = None
-    """The mesh desk (`mesher.Mesher`), when there is a model key to run one with.
-    None means the `mesh` tool answers with why not, and meshing is the caller's own
-    work like any other command."""
+    cad: Any = None
+    """The CAD desk (`cad.CadDesk`), when there is a model key to run one with.
+    None means the `cad` tool answers with why not, and CAD and meshing are the
+    caller's own work like any other command."""
+    reviewer: Any = None
+    """The independent geometry reviewer (`cad.Reviewer`), when there is a model key to
+    run one with. None means the `mesh_review` tool is not offered: a reviewer is a
+    model call with pictures in it, and there is nothing else it could be."""
     on_tokens: Callable[[dict], None] | None = None
-    """Called with the model usage a tool spent on the session's behalf -- the mesh
-    desk's steps -- so it lands in the same totals as the main loop's."""
+    """Called with the model usage a tool spent on the session's behalf -- the CAD
+    desk's steps, the reviewer's look -- so it lands in the same totals as the main
+    loop's."""
+    mode: str = "auto"
+    """How much the person chose to be consulted (`modes.py`). Read at every tool call,
+    so a `/mode` switch applies from the next one."""
+    plan_approved: bool = False
+    """Structured mode: whether a checkpoint has been approved since the session entered
+    the mode. Until one has, `job_start` is held."""
+    approver: Any = None
+    """The `approval.Approver` that puts a question to the person. None when nobody can
+    answer (a one-shot run), which is why a non-auto mode refuses to start there."""
+    on_mode: Callable[[str], None] | None = None
+    """Switches the session's mode (`Loop.set_mode`), for a checkpoint answered with
+    "approve all"."""
+    ceiling: Any = None
+    """The study's spending ceiling on the hosted service (`ceiling.Ceiling`). None
+    when no service is behind the session: then there is no ceiling to meet, and
+    nothing is announced before the first solve."""
+    estimated: bool = False
+    """Whether the line before the first solve has been said this session."""
+    stopped: str | None = None
+    """Why the study stopped in this turn, when it met its ceiling and the ceiling was
+    not raised (`ceiling.resolve`). The loop ends the turn after the call in flight
+    and asks the model nothing more; cleared when the next turn starts."""
+    on_ceiling_raised: Callable[[], None] | None = None
+    """Called once a raise has lifted a pause (`ceiling.resolve`), before the paused
+    call goes again. Set while the workspace's own start is what met the pause
+    (`cli._bring_up`): the start is sent again, so the call goes to a workspace that
+    is coming rather than to the start's stored refusal."""
+    local: bool = False
+    """Whether the workspace is a container on the person's own machine
+    (`backend/docker.py`), which changes what the system prompt says about it."""
+    solver: str = solvers.OPENFOAM
+    """This study's solver (`solvers.py`): `openfoam` or `felix`. It decides the tool
+    list (`tools_for`), how `job_start` reads a launch, and the system prompt the loop
+    sends. Set once, before the first request: by the session for a study whose solver
+    is known, and for one left to choose (`auto`) by the routing request that reads the
+    person's first message (`desk.route`) -- never by the model in this conversation,
+    because a session's system prompt and tool list do not change under it."""
+
+
+def tools_for(ctx: ToolContext) -> list[dict[str, Any]]:
+    """The tools this session can actually serve.
+
+    `cad` and `mesh_review` are conditional: without a desk, or a reviewer, behind it
+    the tool can do nothing but explain that, and a tool in the list that answers "not
+    available" costs the model a call to find out. Taking it out of the list is also
+    what makes the question answerable -- the same prompt run with the desk and without
+    it, which is the only honest way to settle whether a slow natural-language
+    sub-agent beats the bash the caller already has. With both wired the list is
+    `TOOLS` itself, the same object every call, so the cache prefix does not move.
+
+    Neither of those can change during a session: the desk and the reviewer are built
+    once, before the first request, and the solver is fixed. Nothing else is
+    conditional. `checkpoint` used to be -- offered only in structured mode, so a
+    `/mode` switch into or out of it changed the tool list mid-conversation, which
+    rewrote the prompt cache from position 0 and, worse, invalidated every thinking
+    block in the thread: a thinking block is bound to the system prompt, the tool
+    list and the messages before it, and a provider that checks the binding (Bedrock,
+    or Anthropic's API with `prefix_mismatch_behavior: "error"`) refuses the next
+    request with a 400. It is now in every list, in every mode, and answers outside
+    structured mode that checkpoints are structured mode's (`_checkpoint`); the mode
+    itself reaches the model as a harness note (`Loop.set_mode`).
+    """
+    withheld = set()
+    if ctx.cad is None:
+        withheld.add("cad")
+    if ctx.reviewer is None:
+        withheld.add("mesh_review")
+    solver = getattr(ctx, "solver", solvers.OPENFOAM)
+    # No `auto` branch. A study still choosing used to be offered `choose_solver`
+    # alone and then, mid-conversation, the chosen solver's prompt and tools -- and a
+    # thinking block's signature is bound to the system prompt and the tool list it
+    # was made under, so the request after the swap was a 400 on Bedrock ("The block
+    # is bound to a different conversation ... The `system` prompt and the `tools`
+    # list both differ"), and the turn ended with nothing said. The solver is now
+    # settled before the first request (`desk.route`), so the list is the solver's
+    # from turn one; `auto` is never asked for here, and is OpenFOAM's if it were.
+    if solver == solvers.FELIX:
+        offered = FELIX_TOOLS
+    else:
+        offered = TOOLS if not withheld else [
+            tool for tool in TOOLS if tool["name"] not in withheld
+        ]
+    return offered
 
 
 FRESH_SHELL = (
     "Each call runs in a fresh shell: `cwd` carries between calls, nothing else does "
     "-- variables you export, files you source and shell options are gone by the next "
     "one. The OpenFOAM environment and the tutorials' `RunFunctions` helpers are "
-    "loaded again for you on every call, `bash` and `job_start` alike."
+    "loaded again for you on every call, `bash` and `job_start` alike. Pipes run "
+    "under `set -o pipefail`: a stage cut off by `head` or `grep -q` exits 141."
 )
 """The shell contract, said once and repeated verbatim in both tools that run one.
 
@@ -123,7 +293,15 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Run a shell command in the workspace and wait for it. "
             f"{FRESH_SHELL} Capped at {EXEC_MAX_TIMEOUT_S} seconds; use "
-            "job_start for anything longer. Returns the exit code and the output, "
+            "job_start for anything longer. A command still running at "
+            f"{EXEC_SYNC_WINDOW_S} seconds may be moved by the workspace to a detached "
+            "job that runs it again from the start (the hosted workspace does this; a "
+            "local one runs the command to its timeout_s), and this call then waits on "
+            "that job for what is left of timeout_s: a job that ends in time gives its "
+            "exit code and log here as the command's own; one still running when the "
+            "time is up comes back as `still running as job <id>` with the log so far, "
+            "and job_check <id> follows it from there -- the command is running, so it "
+            "is not one to run again. Returns the exit code and the output, "
             "with a pointer to the full log on disk if the output was long."
         ),
         "input_schema": {
@@ -143,6 +321,71 @@ TOOLS: list[dict[str, Any]] = [
                 },
             },
             "required": ["cmd"],
+        },
+    },
+    {
+        "name": "cad",
+        "description": (
+            "Describe a geometry in words, or point at a CAD file already on the "
+            "workspace, and get back an OpenFOAM mesh of it there. A separate agent "
+            "does the work on this same machine — it builds or imports the shape, "
+            "repairs and tags it, chooses the mesher (snappyHexMesh, cfMesh, gmsh "
+            "body-fitted, blockMesh), renders the mesh and measures it, and revises "
+            "until checkMesh passes and the shape measures up to what was asked for. "
+            "You get the picture, the patch table with each patch's area and normal, "
+            "checkMesh's verdict, the script that rebuilds it, and where the case is. "
+            "It is a MESH only: no fields, no boundary conditions, no solver settings "
+            "and no solve — those stay with you. Takes a few minutes."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "request": {
+                    "type": "string",
+                    "description": (
+                        "The shape in words: its sizes with units, which end is the "
+                        "inlet and which the outlet, whether it is a plane (2D) case "
+                        "or a volume, and any property that has to be right — an "
+                        "angle, a radius, a gap, a count. Anything you leave out is "
+                        "the desk's to choose. With a `geometry` file it is what to "
+                        "make of that file instead: which region is the fluid, what "
+                        "to call each patch, what to leave out."
+                    ),
+                },
+                "case": {
+                    "type": "string",
+                    "description": (
+                        "Directory name for the case under the study (default 'mesh')."
+                    ),
+                },
+                "geometry": {
+                    "type": "string",
+                    "description": (
+                        "Absolute path to a .step, .stp, .iges or .igs file under "
+                        f"{WORKSPACE_ROOT}, when the shape already exists as CAD and "
+                        "the job is to prepare that part rather than to author one. "
+                        "It is read on this machine; there is no upload here, so the "
+                        "file has to be on the volume already. Checked for existence "
+                        "and readability before anything starts."
+                    ),
+                },
+                "inputs": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Absolute paths under "
+                        f"{WORKSPACE_ROOT} to anything else the desk should work "
+                        "from: a floorplan or drawing to trace, a CSV of coordinates, "
+                        "a spec sheet. Any file type -- the desk opens them itself and "
+                        "sees what is in them. Use this rather than `geometry` "
+                        "whenever the file is material to work from instead of the "
+                        "part itself. Pass every file the person handed over; each is "
+                        "checked before anything starts, and each is put back beside "
+                        "the build script when it is replayed at the finish."
+                    ),
+                },
+            },
+            "required": ["request"],
         },
     },
     {
@@ -169,8 +412,9 @@ TOOLS: list[dict[str, Any]] = [
             "Get a job's status together with whatever log has appeared since "
             "log_offset. Cheap to call repeatedly. With wait_s it holds the answer "
             "until the job ends or the wait runs out, ending early if the user says "
-            "something - quieter than pacing with sleep in bash, which counts "
-            "against the bash time cap."
+            "something (their words then follow this result in the same message; "
+            "answer them and call again) - quieter than pacing with sleep in bash, "
+            "which counts against the bash time cap."
         ),
         "input_schema": {
             "type": "object",
@@ -210,6 +454,9 @@ TOOLS: list[dict[str, Any]] = [
             "Start a long command detached and return a job id immediately. The job "
             "keeps running after your turn ends, and after this session closes. "
             f"{FRESH_SHELL} "
+            "Do not redirect stdout or stderr to a file: the detached job already "
+            "captures both, and `job_check` can only stream what the job captures. "
+            "Commands that pipe into `tee` or use `>`, `>>`, `2>&1` are refused. "
             "A solver started serially holds one core for the whole run, however "
             "many the container has; a case put through `decomposePar` and started "
             "with `mpirun -np N` holds N. What the extra ranks return falls away as "
@@ -221,7 +468,13 @@ TOOLS: list[dict[str, Any]] = [
             "per rank per write time, and the workspace is a network filesystem that "
             "charges by the file: `-fileHandler collated`, passed to decomposePar, "
             "the solver and reconstructPar alike, writes one set instead of N, which "
-            "reconstructs faster and leaves the solve unchanged."
+            "reconstructs faster and leaves the solve unchanged. "
+            "A solver launched into a case that already holds written time steps, with "
+            "`startFrom startTime` in its controlDict, would start from t=0 again and "
+            "write over them; this tool refuses that launch and says so. To carry a "
+            "transient on -- more time, denser writes -- set `startFrom latestTime` "
+            "(every write so far is kept and the run continues from the last one); "
+            "to start over on purpose, pass overwrite=true or run in a fresh directory."
         ),
         "input_schema": {
             "type": "object",
@@ -240,7 +493,17 @@ TOOLS: list[dict[str, Any]] = [
                     "items": {"type": "string"},
                     "description": (
                         "Regexes matched against log lines. The first match terminates "
-                        "the job and the matching line is reported back. Optional."
+                        "the job and the matching line is reported back. Optional. Do not "
+                        "use a broad `Floating point exception` pattern: OpenFOAM prints "
+                        "that phrase in its harmless trapFpe startup banner."
+                    ),
+                },
+                "overwrite": {
+                    "type": "boolean",
+                    "description": (
+                        "Allow a solver to restart from startTime in a case that already "
+                        "holds written time steps, discarding them. Default false: the "
+                        "launch is refused instead."
                     ),
                 },
             },
@@ -248,39 +511,48 @@ TOOLS: list[dict[str, Any]] = [
         },
     },
     {
-        "name": "mesh",
+        "name": "mesh_review",
         "description": (
-            "Describe a geometry in words and get back an OpenFOAM mesh of it on the "
-            "workspace. A separate agent builds it on this same machine — it chooses "
-            "the mesher (gmsh body-fitted, blockMesh, snappyHexMesh, cfMesh), writes "
-            "the geometry as a script, renders the mesh and measures it, and revises "
-            "until checkMesh passes and the shape measures up to what was asked for. "
-            "You get the picture, the patch table with each patch's area and normal, "
-            "checkMesh's verdict, and where the case is. It is a MESH only: no fields, "
-            "no boundary conditions, no solver settings and no solve — those stay with "
-            "you. Takes a few minutes."
+            "Have an independent reviewer look at an OpenFOAM mesh that already exists "
+            "-- one this session built with bash, one the cad tool returned, or one "
+            "somebody uploaded -- from several views (2D: overview, cells, zoomed "
+            "quadrants; 3D: four isometric corners, six orthographic faces, mid-plane "
+            "cuts) and judge whether it is the shape that was asked for. It does not "
+            "run checkMesh and does not judge mesh quality: it compares the pictures to "
+            "the request and fails only for what changes the CFD answer -- wrong "
+            "topology, sharp corners where curves were asked for, proportions, a gap "
+            "one cell wide, inlet and outlet on the wrong ends. Returns PASS or FAIL "
+            "with each problem and the view it was seen in, plus the first view as a "
+            "picture. Takes about a minute. Not a substitute for checkMesh."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "request": {
-                    "type": "string",
-                    "description": (
-                        "The shape in words: its sizes with units, which end is the "
-                        "inlet and which the outlet, whether it is a plane (2D) case "
-                        "or a volume, and any property that has to be right — an "
-                        "angle, a radius, a gap, a count. Anything you leave out is "
-                        "the mesh desk's to choose."
-                    ),
-                },
                 "case": {
                     "type": "string",
                     "description": (
-                        "Directory name for the case under the study (default 'mesh')."
+                        "The case directory holding constant/polyMesh: relative to this "
+                        f"study's own directory, or absolute under {WORKSPACE_ROOT}."
+                    ),
+                },
+                "request": {
+                    "type": "string",
+                    "description": (
+                        "What the geometry is supposed to be, with sizes and units, "
+                        "which end is which, whether it is 2D or 3D, and every property "
+                        "that has to be right. The reviewer judges the pictures against "
+                        "this and nothing else."
+                    ),
+                },
+                "notes": {
+                    "type": "string",
+                    "description": (
+                        "What you or the desk believe was built and measured, so the "
+                        "reviewer can check those claims against the pictures. Optional."
                     ),
                 },
             },
-            "required": ["request"],
+            "required": ["case", "request"],
         },
     },
     {
@@ -288,8 +560,9 @@ TOOLS: list[dict[str, Any]] = [
         "description": (
             "Read a window of a file as text, or list a directory. Byte offsets, so "
             "arbitrarily large files are readable a piece at a time. A path ending in "
-            ".png, .jpg, .gif or .webp comes back as the picture itself, so anything "
-            "you render you can also look at."
+            ".png, .jpg, .gif or .webp comes back as the picture itself, whole, "
+            "whatever offset or limit is given, so anything you render you can also "
+            "look at."
         ),
         "input_schema": {
             "type": "object",
@@ -299,6 +572,31 @@ TOOLS: list[dict[str, Any]] = [
                 "limit": {"type": "integer", "description": "Bytes to read."},
             },
             "required": ["path"],
+        },
+    },
+    {
+        "name": "send_to_agent",
+        "description": (
+            "For a side question only (the harness says, in the message, when one is "
+            "being asked). Passes what the person asked in that side question on to the "
+            "work in progress, in their own words, at its next step -- the way a message "
+            "they type reaches it -- with an optional short note of yours, labelled as "
+            "yours. Use it when they asked for something to be done, changed or "
+            "considered, rather than only for information. Outside a side question it "
+            "sends nothing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "note": {
+                    "type": "string",
+                    "description": (
+                        "Optional, one or two sentences: context the side answer found "
+                        "that the work in progress would want beside the person's words. "
+                        "Not a rewrite of what they said; their words go as they are."
+                    ),
+                },
+            },
         },
     },
     {
@@ -315,6 +613,134 @@ TOOLS: list[dict[str, Any]] = [
     },
 ]
 
+
+
+FELIX_FRESH_SHELL = (
+    "Each call runs in a fresh shell: `cwd` carries between calls, nothing else does "
+    "-- variables you export, files you source and shell options are gone by the next "
+    "one."
+)
+"""`FRESH_SHELL` for a Felix workspace, which has no OpenFOAM environment to load."""
+
+FELIX_ONLY = frozenset({"cad", "mesh_review"})
+"""Withheld from a Felix study: the CAD desk and the reviewer build and judge OpenFOAM
+meshes, and a Felix case needs a tagged `.vtu`."""
+
+
+def _felix_variant(tool: dict[str, Any]) -> dict[str, Any]:
+    """One of `TOOLS` as a Felix study is offered it."""
+    if tool["name"] == "bash":
+        return {**tool, "description": tool["description"].replace(
+            FRESH_SHELL, FELIX_FRESH_SHELL)}
+    if tool["name"] == "job_start":
+        return FELIX_JOB_START
+    return tool
+
+
+FELIX_JOB_START: dict[str, Any] = {
+    "name": "job_start",
+    "description": (
+        "Start a long command detached and return a job id immediately. The job "
+        "keeps running after your turn ends, and after this session closes. "
+        f"{FELIX_FRESH_SHELL} "
+        "Do not redirect stdout or stderr to a file: the detached job already "
+        "captures both, and `job_check` can only stream what the job captures. "
+        "Commands that pipe into `tee` or use `>`, `>>`, `2>&1` are refused. "
+        "A solve is `felix run <case> --gpu G [--wall S]`: it uploads the case, runs "
+        "it on one cloud GPU of type G (`felix gpus` lists them as JSON with "
+        "`usd_per_hour`, for choosing and not for the user), billed per second while "
+        "it runs. This job's log is its "
+        "stderr: a `NOTE:` naming the solve, then the solver's lines as they are "
+        "written -- `ERROR:`, `WARNING:` and `NOTE:` lines and one `step=` record per "
+        "step. The results come back into `<case>/output/` (an earlier `output/` is "
+        "moved to `output.previous/`), and stdout is the solve's final status as JSON "
+        "(`state`, `gpu`, `billed_s`, `cost_usd`, `exit_code`, `error`). Exit 0: the "
+        "solve succeeded; 1: it failed, was killed, or was refused by the service "
+        "(one `ERROR:` line with the status, e.g. `402 allowance_exhausted`, "
+        "`403 plan_limit` or `409 study_paused`); 2: refused "
+        "here before anything was sent, with one `ERROR:` line -- a case whose "
+        "`output.every` is 0 or unset (a solve writes snapshots so that it can be "
+        "continued), one missing `case.yaml` or its mesh, or one holding a symlink. "
+        "`--wall` caps the solve's wall time in seconds. `felix continue <case> --gpu "
+        "G [--wall S]` points `io.yaml`'s `warm_start` at the newest snapshot and sets "
+        "`nsteps` to the steps that remain, in place, and submits that. `job_kill` "
+        "stops a solve on its GPU too, and what it wrote so far still comes back."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "cmd": {"type": "string"},
+            "cwd": {
+                "type": "string",
+                "description": (
+                    "Directory to run in. Defaults to this study's own "
+                    "directory, which your briefing names."
+                ),
+            },
+            "name": {"type": "string", "description": "A label for your own reference."},
+            "kill_on": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Regexes matched against log lines. The first match terminates "
+                    "the job and the matching line is reported back. Optional."
+                ),
+            },
+        },
+        "required": ["cmd"],
+    },
+}
+"""`job_start` in a Felix study: what `felix run` is, with none of the OpenFOAM
+launch facts (ranks, collated files, the restart guard, the trapFpe banner) that
+`_job_start` does not apply to it."""
+
+FELIX_TOOLS: list[dict[str, Any]] = [
+    _felix_variant(tool) for tool in TOOLS if tool["name"] not in FELIX_ONLY
+]
+"""What a Felix study is offered, sorted by name like `TOOLS` and the same object every
+call, so the cache prefix does not move."""
+
+CHECKPOINT_TOOL: dict[str, Any] = {
+    "name": "checkpoint",
+    "description": (
+        "Put where the study stands in front of the person and wait for their answer. "
+        "Only in structured mode, which the person chooses when they want to agree a "
+        "plan and hear from you after each stage; in any other mode nothing is put to "
+        "them and the result says so. The result says whether they approved, and "
+        "carries their words when they asked for changes. In structured mode job_start "
+        "calls are held until a checkpoint has been approved."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "stage": {
+                "type": "string",
+                "description": (
+                    "What this checkpoint is about: plan, or a stage of the study "
+                    "(geometry, preview, mesh, checkMesh, probe, solve, reconstruct, "
+                    "render, animate, report)."
+                ),
+            },
+            "summary": {
+                "type": "string",
+                "description": "What was done, or what is proposed, in plain words.",
+            },
+            "next": {
+                "type": "string",
+                "description": "What happens next if the person approves.",
+            },
+        },
+        "required": ["stage", "summary", "next"],
+    },
+}
+"""In every list, every mode (`tools_for`): a tool list that changed with `/mode` was a
+mid-conversation change to what the thread's thinking blocks are bound to."""
+
+for _offered in (TOOLS, FELIX_TOOLS):
+    # In place, so `TOOLS` and `FELIX_TOOLS` stay the objects `tools_for` hands back --
+    # the same object every request -- and stay sorted by name.
+    _offered.append(CHECKPOINT_TOOL)
+    _offered.sort(key=lambda tool: tool["name"])
 TOOL_NAMES = frozenset(tool["name"] for tool in TOOLS)
 
 
@@ -342,8 +768,32 @@ def _echo(ctx: ToolContext, body: str) -> str:
             f"in this conversation, so it is not repeated here]\n{head}")
 
 
-def dispatch(ctx: ToolContext, name: str, tool_input: dict[str, Any]) -> tuple[ToolResult, bool]:
-    """Run one tool call. Returns (content, is_error)."""
+def _traced_size(result: ToolResult) -> int:
+    """Roughly how much this result costs the next request, for the trace row.
+
+    Cheap on purpose: it is read once per call and only when something is
+    listening. A picture is counted as its own bytes rather than rendered, because
+    `describe` base64s it and the number wanted here is what the transport carries.
+    """
+    if isinstance(result, str):
+        return len(result)
+    total = 0
+    for block in result or ():
+        if isinstance(block, dict):
+            source = block.get("source") or {}
+            total += len(block.get("text") or "") + len(source.get("data") or "")
+    return total
+
+
+def dispatch(ctx: ToolContext, name: str, tool_input: dict[str, Any],
+             call_id: str | None = None) -> tuple[ToolResult, bool]:
+    """Run one tool call. Returns (content, is_error).
+
+    `call_id` is the model's own id for this call, passed through only so a trace
+    row can be joined to the turn that asked for it. It is optional because the
+    tool has no use for it: a trace with timings and no identity could say a tool
+    took nine seconds and not which of the four calls in that turn it was.
+    """
     ctx.calls += 1
     handler = _HANDLERS.get(name)
     if handler is None:
@@ -351,15 +801,20 @@ def dispatch(ctx: ToolContext, name: str, tool_input: dict[str, Any]) -> tuple[T
     # Read the clock only when something is listening: the handlers below time
     # themselves off the same `time.monotonic`, and tests drive that with a fake.
     started = time.monotonic() if trace.on else 0.0
+    ok, size = True, 0
     try:
-        result = handler(ctx, tool_input)
+        result = _handled(ctx, handler, tool_input)
+        if trace.on:
+            size = _traced_size(result)
         # Only text is collapsed, and only when it repeats exactly. An image is already
         # handled by the eviction policy, and an error is never worth collapsing --
         # the same failure twice is a fact about the run, not a duplicate.
         return (_echo(ctx, result) if isinstance(result, str) else result), False
     except BackendError as exc:
+        ok = False
         return str(exc), True
     except Exception as exc:  # a harness bug is a fact the model should see
+        ok = False
         return f"{type(exc).__name__}: {exc}", True
     finally:
         if trace.on:
@@ -368,7 +823,26 @@ def dispatch(ctx: ToolContext, name: str, tool_input: dict[str, Any]) -> tuple[T
                 tool=name,
                 seconds=round(time.monotonic() - started, 3),
                 cmd=str(tool_input.get("cmd") or tool_input.get("path") or "")[:200],
+                tool_use_id=call_id,
+                result={"ok": ok, "bytes": size},
             )
+
+
+def _handled(ctx: ToolContext, handler: Callable[[ToolContext, dict[str, Any]], Any],
+             tool_input: dict[str, Any]) -> Any:
+    """Run `handler`, putting a `409 study_paused` to the person and running it again
+    once the ceiling is raised (`ceiling.resolve`).
+
+    Again from the top, because the pause is the service refusing before it did
+    anything: a new sandbox, a model call or a GPU solve that never began. A pause
+    left standing is raised as it came, and the model reads it as any failed call."""
+    for _ in range(ceiling.MAX_RAISES_PER_CALL):
+        try:
+            return handler(ctx, tool_input)
+        except BackendError as exc:
+            if ceiling.paused(exc) is None or not ceiling.resolve(ctx, exc):
+                raise
+    return handler(ctx, tool_input)
 
 
 # -- handlers ------------------------------------------------------------------
@@ -377,8 +851,13 @@ def dispatch(ctx: ToolContext, name: str, tool_input: dict[str, Any]) -> tuple[T
 def _bash(ctx: ToolContext, args: dict[str, Any]) -> str:
     asked = int(args.get("timeout_s") or 120)
     started = time.monotonic()
-    result = ctx.backend.exec(args["cmd"], cwd=args.get("cwd") or ctx.home, timeout_s=asked)
+    result = ctx.backend.exec(_pipefail(args["cmd"]), cwd=args.get("cwd") or ctx.home,
+                              timeout_s=asked)
     elapsed = time.monotonic() - started
+    if getattr(result, "promoted", False) or getattr(result, "job_id", ""):
+        # The command belongs to a job now, and nothing below applies to it: there is
+        # no exit code to print, and the output is the job's log.
+        return _promoted(ctx, args, result, asked=asked, window=elapsed)
     notes = []
     if elapsed >= SLOW_COMMAND_S:
         # A four-minute command and a two-second one read identically otherwise, so
@@ -405,20 +884,15 @@ def _bash(ctx: ToolContext, args: dict[str, Any]) -> str:
             f"when a command outruns its timeout_s (this one ran with {ran_with}s). "
             "job_start has no time limit.]"
         )
+    sigpipe = _sigpipe_note(result.exit_code, args["cmd"])
+    if sigpipe:
+        notes.append(sigpipe)
     if getattr(result, "stderr", "").strip():
         # The workspace itself, not the command: a working directory that is gone, a
         # capture-sync that failed. Surfaced so a platform failure is legible as one
         # instead of reading like a command that merely produced nothing and being
         # retried into the same wall.
         notes.append(f"[workspace: {result.stderr.strip()[:300]}]")
-    if getattr(result, "job_id", ""):
-        # The command ran past the synchronous window and became a detached job. Said
-        # plainly so the next step is job_check on this id, not a re-run of a command
-        # that is already running.
-        notes.append(
-            f"[moved to detached job {result.job_id}: it outran the synchronous exec "
-            f"window and is running now -- follow it with job_check, do not re-run it]"
-        )
     total = None
     if result.truncated and result.log_path:
         try:
@@ -431,6 +905,148 @@ def _bash(ctx: ToolContext, args: dict[str, Any]) -> str:
     lines.extend(notes)
     if result.truncated or clipped:
         lines.append(_truncation_marker(len(body.encode("utf-8")), total, result.log_path))
+    lines.append("")
+    lines.append(body)
+    return "\n".join(lines)
+
+
+def _promoted(ctx: ToolContext, args: dict[str, Any], result: Any, *, asked: int,
+              window: float) -> str:
+    """A `bash` whose command the workspace moved to a detached job, waited out.
+
+    The caller asked for `asked` seconds and the workspace held the command for
+    `window` of them before starting it again from scratch as job `result.job_id`
+    (`ExecResult.promoted`). What the caller wanted was the command's result, so this
+    follows the job for the rest of the time it asked for -- the same held wait a
+    `job_check` with `wait_s` makes, ended by the same three things: the job ending,
+    the time running out, the person writing or leaving -- and hands back the job's
+    exit code and log as the command's own when the job ends in time. When it does
+    not, the first line says so, `still running as job <id>`, and never `exit_code`.
+
+    Measured before this (production, 2026-09-21, study 20260921-033019-e1b4): `bash
+    sleep 240`, `sleep 200` and `sleep 180`, each with `timeout_s=300`, came back
+    after the 120 s window as `exit_code: 0` with the service's note beneath it, and
+    the model read three commands that had finished with no output. It polled the
+    first job once, two seconds in, and none of them again; the rows stayed `running`
+    for 46, 35 and 20 minutes, until the reaper read the exit codes off the store
+    (fixed on the service's side by watching the job it makes -- `jobs.watch_job`).
+
+    The job is recorded as the session's, the way `job_start` records one: a
+    `job_check` on it continues the log from where this left off instead of sending
+    it again, the jobs panel shows it, and a job handed back still running is polled
+    by the watch loop, which wakes the model when it ends -- the poll that never
+    happened above. The transport can fail between the promotion and the answer, and
+    the promotion is the fact that must not be lost behind that: a status or a log
+    that could not be read is a note, and the first line stands.
+    """
+    job_id = str(result.job_id)
+    cwd = args.get("cwd") or ctx.home
+    ctx.store.record_job(job_id, cmd=args["cmd"], name=None, cwd=cwd)
+    _announce_jobs(ctx)
+    budget = min(asked, EXEC_MAX_TIMEOUT_S)
+    notes: list[str] = []
+    if asked > EXEC_MAX_TIMEOUT_S:
+        notes.append(
+            f"[timeout_s={asked} exceeds the {EXEC_MAX_TIMEOUT_S}s ceiling for a "
+            f"synchronous command; this call holds for {EXEC_MAX_TIMEOUT_S}s at most]"
+        )
+    if getattr(result, "stderr", "").strip():
+        notes.append(f"[workspace: {result.stderr.strip()[:300]}]")
+    mesher = _mesher_note(ctx, args)
+    if mesher:
+        # A snappyHexMesh that outran its window on a one-cell-thick mesh is the very
+        # stall this note describes, so it is worth its round trip here too.
+        notes.append(mesher.strip())
+
+    status: JobStatus | None = None
+    remaining = max(0.0, budget - window)
+    waited = 0.0
+    heard = left = False
+    data, next_offset, eof = "", 0, False
+    trouble = ""
+    try:
+        status = ctx.backend.job_status(job_id)
+        if remaining > 0 and status.running:
+            status, waited, heard, left = _hold(ctx, job_id, status, remaining)
+        data, next_offset, eof = ctx.backend.job_tail(job_id, offset=0)
+    except BackendError as exc:
+        trouble = f"[the job could not be read just now: {exc}]"
+    if status is not None:
+        ctx.store.update_job(
+            job_id,
+            status=status.status,
+            end_reason=status.end_reason,
+            exit_code=status.exit_code,
+            log_offset=next_offset,
+        )
+        _announce_jobs(ctx)
+
+    first_run = (result.output or "").strip()
+    output = data
+    if first_run:
+        # Two runs of one command: what the synchronous run printed before it was
+        # moved, then the job's log from the start. Labelled, so the repeat of a
+        # command's opening lines reads as what it is.
+        output = (f"[what the command printed in its first run, before it was moved:]\n"
+                  f"{first_run}\n[the job's log, from the start:]\n{data}")
+    body, clipped = _clip(output, ctx.max_output)
+    log_line = f"log: bytes 0–{next_offset}, eof={eof}"
+    if clipped:
+        log_line += (f" (this window clipped at {ctx.max_output} bytes; job_check from "
+                     f"{len(body.encode('utf-8'))})")
+
+    ended = status is not None and not status.running
+    if ended:
+        # The command's own result, arrived at the long way: the job's exit code where
+        # the exit code goes, and the job's log where the output goes.
+        first = (f"exit_code: {status.exit_code}" if status.exit_code is not None
+                 else describe_job(status))
+        lines = [first]
+        if window + waited >= SLOW_COMMAND_S:
+            lines.append(f"[took {window + waited:.0f}s]")
+        lines.append(
+            f"[moved to job {job_id} at {window:.0f}s: the command was still running "
+            f"at the synchronous window, so the workspace started it again from the "
+            f"start as a detached job, and this call waited {waited:.0f}s more for it. "
+            f"The exit code and output here are the job's]"
+        )
+        lines.extend(notes)
+        sigpipe = _sigpipe_note(status.exit_code, args["cmd"])
+        if sigpipe:
+            lines.append(sigpipe)
+        if trouble:
+            lines.append(trouble)
+        if status.exit_code is not None:
+            lines.append(describe_job(status))
+        lines.append(log_line)
+        lines.append("")
+        lines.append(body)
+        return "\n".join(lines)
+
+    lines = [f"still running as job {job_id} (promoted after {window:.0f} s; "
+             f"{waited:.0f} s waited)"]
+    lines.append(
+        f"[the command was still running at the synchronous window, so the workspace "
+        f"started it again from the start as detached job {job_id}, and this call "
+        f"followed the job for {waited:.0f}s of the {remaining:.0f}s left of its "
+        f"timeout_s={asked}. It is running now: job_check {job_id} follows it (wait_s "
+        f"holds the answer until it ends), and it is not a command to run again]"
+    )
+    lines.extend(notes)
+    if left:
+        lines.append(_left_note())
+    elif heard:
+        # Remembered from the wait rather than asked again: the question drains the
+        # inbox, and a second asking would drop the one sentence that explains a wait
+        # cut short. Not `_heard_note`'s usual "call this again" -- calling `bash`
+        # again would run the command a third time.
+        lines.append(_heard_note("job_check", "the command is still running as that job",
+                                 then=f"follow it with job_check {job_id}"))
+    if trouble:
+        lines.append(trouble)
+    if status is not None:
+        lines.append(describe_job(status))
+        lines.append(log_line)
     lines.append("")
     lines.append(body)
     return "\n".join(lines)
@@ -478,28 +1094,83 @@ def _written_run_shape(args: dict[str, Any]) -> str:
 
 def _read_file(ctx: ToolContext, args: dict[str, Any]) -> str | list[dict[str, Any]]:
     path = args["path"]
-    info = ctx.backend.stat(path)
+    info = ctx.backend.stat(path, timeout=READ_TIMEOUT_S, max_attempts=READ_ATTEMPTS)
     if info.is_dir:
         listing = "\n".join(info.entries) if info.entries else "(empty)"
         return f"{path} — directory, {len(info.entries)} entries\n\n{listing}"
 
+    # An image is always the picture, whatever window was asked for. Its bytes tell a
+    # model nothing the picture's own line does not (format, dimensions, size), and GPT
+    # fills in every optional argument: it read a 250 KB render with `offset: 0` and a
+    # 48 KB limit and reported the plot "not visually inspected", and on prod
+    # (2026-10-30) a `limit: 1000` read of a PNG sent NUL bytes into the transcript.
     media = images.media_type(path)
-    if media is not None and not (args.get("offset") or args.get("limit")):
+    if media is not None:
         return _read_image(ctx, path, info, media)
 
     offset = max(0, int(args.get("offset") or 0))
     limit = int(args.get("limit") or ctx.max_output)
-    raw = ctx.backend.get_file(path, offset=offset, limit=limit)
+    raw = ctx.backend.get_file(path, offset=offset, limit=limit,
+                               timeout=READ_TIMEOUT_S, max_attempts=READ_ATTEMPTS)
+    raw, size, moving = _read_again_if_it_moved(ctx, path, info.size, raw, offset, limit)
     text = raw.decode("utf-8", errors="replace")
     body, clipped = _clip(text, ctx.max_output)
 
     end = offset + len(raw)
-    header = f"{path} — bytes {offset}–{end} of {info.size}"
+    header = f"{path} — bytes {offset}–{end} of {size}"
     if clipped:
         header += f" (shown to {offset + len(body.encode('utf-8'))}; raise offset for more)"
-    elif end < info.size:
-        header += f"; {info.size - end} bytes remain past this window"
-    return f"{header}\n\n{body}"
+    elif end < size:
+        header += f"; {size - end} bytes remain past this window"
+    return f"{header}{moving}\n\n{body}"
+
+
+def _size_now(ctx: ToolContext, path: str) -> int | None:
+    """What the path measures at this moment, or nothing if it cannot be asked.
+
+    A file that vanished between the read and the check is a race worth surviving
+    quietly: the bytes are in hand and they were real when they were fetched. Turning
+    that into a failed tool call would trade a rare inaccuracy for a common one."""
+    try:
+        return ctx.backend.stat(path, timeout=READ_TIMEOUT_S,
+                                max_attempts=READ_ATTEMPTS).size
+    except Exception:  # noqa: BLE001 - a check that cannot run makes no claim
+        return None
+
+
+def _read_again_if_it_moved(ctx: ToolContext, path: str, size: int, raw: bytes,
+                            offset: int, limit: int) -> tuple[bytes, int, str]:
+    """Read once more when the file grew under the read, and say so if it is still growing.
+
+    `_read_file` stats the path, asks for exactly that many bytes and is handed exactly
+    that many, so the short-read guard that covers pictures -- `len(data) < info.size`
+    in `_read_image` -- cannot fire on anything else. A `postProcessing` forces file, a
+    `.dat`, a `.csv` or a solver log read while OpenFOAM is still appending to it comes
+    back agreeing with itself all the way up, and a file cut short is a number the model
+    will happily average (F-64). Images were given their own answer after a half-written
+    PNG ended two sessions -- `images.incomplete` refuses one with no end marker -- and
+    the text that the conclusions are actually drawn from had nothing.
+
+    A second stat is the whole check. If the size moved, the writer was mid-flight while
+    the bytes were being fetched, and one more read usually lands on a finished file; it
+    costs one round trip on a path that already makes several. If the size is still
+    moving after that, no number of reads will settle it, so what comes back says which
+    of the two it is rather than looking whole either way.
+    """
+    grown = _size_now(ctx, path)
+    if grown is None or grown == size:
+        return raw, size, ""
+    raw = ctx.backend.get_file(path, offset=offset, limit=limit,
+                               timeout=READ_TIMEOUT_S, max_attempts=READ_ATTEMPTS)
+    settled = _size_now(ctx, path)
+    if settled is None or settled == grown:
+        return raw, grown if settled is None else settled, ""
+    return raw, settled, (
+        f"\nStill being written: {size} bytes when it was measured, {grown} after the "
+        f"first read, {settled} after the second. What follows is a snapshot of a file "
+        "something is still appending to, so it may stop part-way through a line or a "
+        "record; the path read again once the writer has finished gives the whole of it."
+    )
 
 
 def _read_image(ctx: ToolContext, path: str, info: Any, media: str) -> str | list[dict[str, Any]]:
@@ -517,11 +1188,27 @@ def _read_image(ctx: ToolContext, path: str, info: Any, media: str) -> str | lis
     # Ask for the whole thing by name. A backend answering an unbounded read with its
     # own page size is the normal case, and a picture cut off at that boundary is not
     # a smaller picture -- it is a corrupt one that still passes every check here.
-    data = ctx.backend.get_file(path, limit=info.size)
+    data = ctx.backend.get_file(path, limit=info.size, timeout=READ_TIMEOUT_S,
+                                max_attempts=READ_ATTEMPTS)
     if len(data) < info.size:
         return (
             f"{path} — {media}, {info.size} bytes, but only {len(data)} came back. "
             "A part of an image is not a smaller image, so it is not attached."
+        )
+    # The check above catches a read the transport cut short. This one catches a file
+    # that was whole when it was measured and half-written when it was made: a figure
+    # read back while matplotlib is still saving it stats at its current size, reads
+    # back exactly that many bytes, and agrees with itself all the way to the API,
+    # which refuses it with a 400 and ends the session. images.incomplete carries the
+    # incident. Saying so as text is strictly better than attaching it: the model finds
+    # out the picture is not ready and can simply look again.
+    why = images.incomplete(data, media)
+    if why is not None:
+        return (
+            f"{path} — {media}, {len(data)} bytes, but not a whole image: {why}. "
+            "Nothing is attached, because a partial image is refused by the model API "
+            "rather than shown. If something is still writing this file, wait for it "
+            "to finish and read the path again."
         )
     if ctx.on_render is not None:
         try:
@@ -540,9 +1227,88 @@ def _read_image(ctx: ToolContext, path: str, info: Any, media: str) -> str | lis
     ]
 
 
+def _pipefail(cmd: str) -> str:
+    """`cmd` with `set -o pipefail` ahead of it, when it has a pipe in it.
+
+    Without it a pipeline's status is its last stage's, and `blockMesh | tail -40`
+    returned exit_code 0 from a FOAM FATAL ERROR because `tail` succeeded (#48). The
+    model read the text that time and recovered; nothing that trusts the exit code
+    would have. Both workspaces hand commands to `bash -lc`. A command without a pipe
+    goes as written."""
+    if not _PIPE.search(cmd):
+        return cmd
+    return f"set -o pipefail\n{cmd}"
+
+
+_PIPE = re.compile(r"(?<!\|)\|(?!\|)")
+"""A `|` or `|&` that is not half of `||`."""
+
+SIGPIPE_EXIT = 141
+"""128 + SIGPIPE: what `pipefail` makes of `grep ... | head` when `head` stops reading
+first and `grep` is killed for writing on."""
+
+
+def _sigpipe_note(exit_code: int | None, cmd: str) -> str:
+    """What a 141 from a piped command is, where its exit code is shown.
+
+    The same thing happens inside a condition, where nothing shows it:
+    `if cat log | grep -q OK` takes the else branch when `grep -q` stops reading a
+    long log first. `FRESH_SHELL` states that for the model ahead of time."""
+    if exit_code != SIGPIPE_EXIT or not _PIPE.search(cmd):
+        return ""
+    return (f"[exit_code {SIGPIPE_EXIT} is SIGPIPE: piped commands run with "
+            "`set -o pipefail`, and a stage was cut off when the one after it stopped "
+            "reading (as `head` and `grep -q` do).]")
+
+
+def _stdio_redirected(cmd: str) -> bool:
+    """Whether `cmd` hides stdout/stderr from the job capture that `job_check` reads.
+
+    Measured: `interFoam > log.interFoam 2>&1` completed with a 310 KB log on disk
+    while `job_check` reported `log_size=0` (C-03, C-07, C-08)."""
+    if re.search(r"(?:^|[\s;|&])(?:>>?|2>>?|&>)\s", cmd):
+        return True
+    if "2>&1" in cmd or ">&2" in cmd:
+        return True
+    if re.search(r"\|\s*tee\b", cmd):
+        return True
+    return False
+
+
 def _job_start(ctx: ToolContext, args: dict[str, Any]) -> str:
+    felix = getattr(ctx, "solver", solvers.OPENFOAM) == solvers.FELIX
+    # The restart guard, the trapFpe check and the launch notes read OpenFOAM cases
+    # (controlDict, time directories, a mesher's dictionaries); a Felix solve has none.
+    refusal = None if felix else _restart_guard(ctx, args)
+    if refusal:
+        return refusal
+    cmd = args["cmd"]
+    if _stdio_redirected(cmd):
+        return (
+            "not started: this command redirects stdout/stderr (or pipes into tee). "
+            "The detached job already captures both; `job_check` can only stream "
+            "what the job captures. Drop the redirect and call again."
+        )
+    trapfpe_banner = "trapFpe: Floating point exception trapping enabled"
+    for pattern in args.get("kill_on") or []:
+        if felix:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                return f"not started: invalid kill_on regex {pattern!r}: {exc}"
+            continue
+        try:
+            matches_banner = re.search(pattern, trapfpe_banner)
+        except re.error as exc:
+            return f"not started: invalid kill_on regex {pattern!r}: {exc}"
+        if matches_banner:
+            return (
+                f"not started: kill_on regex {pattern!r} also matches OpenFOAM's harmless "
+                f"startup line `{trapfpe_banner}`. Anchor or narrow the regex so the job "
+                "is killed only by an actual crash line."
+            )
     job_id = ctx.backend.job_start(
-        args["cmd"],
+        _pipefail(cmd),
         cwd=args.get("cwd") or ctx.home,
         name=args.get("name"),
         kill_on=args.get("kill_on") or None,
@@ -552,7 +1318,87 @@ def _job_start(ctx: ToolContext, args: dict[str, Any]) -> str:
     )
     _announce_jobs(ctx)
     label = f" ({args['name']})" if args.get("name") else ""
+    if felix:
+        return f"started job {job_id}{label}"
     return f"started job {job_id}{label}{_solve_shape(ctx, args)}{_mesher_note(ctx, args)}"
+
+
+_TIME_DIR = re.compile(r"/(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)/?$")
+"""A time directory's name at the end of a path: `0.8`, `100`, `1e-05`. Anything else
+under a case or a `processors*` directory -- `constant`, `system`, `log.x` -- is not."""
+
+
+def _written_times(ctx: ToolContext, case: str) -> list[float]:
+    """The time steps a case already holds on disk, decomposed or not.
+
+    One `ls` covers the three places OpenFOAM writes them: the case itself, one
+    `processorN/` per rank (the default decomposed layout) and `processorsN/` (the
+    collated layout, one directory for all ranks). An unreadable case -- no directory,
+    a workspace that did not answer -- yields no times, and the guard that reads this
+    then does not fire: a guard on bad information would refuse first launches."""
+    listing = (
+        f"ls -d {shlex.quote(case)}/[0-9]* {shlex.quote(case)}/processor*/[0-9]* "
+        f"{shlex.quote(case)}/processors*/[0-9]* 2>/dev/null"
+    )
+    try:
+        out = ctx.backend.exec(listing, timeout_s=30).output or ""
+    except Exception:  # noqa: BLE001 - not knowing is not a reason to refuse
+        return []
+    times: set[float] = set()
+    for line in out.splitlines():
+        found = _TIME_DIR.search(line.strip())
+        if found:
+            try:
+                times.add(float(found.group(1)))
+            except ValueError:
+                continue
+    return sorted(times)
+
+
+def _restart_guard(ctx: ToolContext, args: dict[str, Any]) -> str:
+    """Refuse a solver launch that would write over a transient's results.
+
+    The loss this stops, measured: a 2D transient had run 22 minutes to t=0.8 when
+    the person asked for a gif. The agent raised `endTime`, tightened `writeInterval`
+    and relaunched the same command in the same directory -- and the controlDict said
+    `startFrom startTime`, so pimpleFoam began again at t=0 and rewrote the
+    `processors4/` time directories it had spent those minutes on (study
+    20260920-161908-c7ef). Nothing in the harness said a word.
+
+    The rule is the smallest one that catches it: a solving command, a case that
+    already holds time steps later than `startTime`, and a controlDict whose
+    `startFrom` is not `latestTime` (`startTime` is OpenFOAM's usual choice, and an
+    absent entry is refused too, because the dictionary does not parse without one).
+    The refusal names the times at stake and the two honest ways forward; a launch that
+    truly means to start over says `overwrite=true`. Meshers, post-processing, and the
+    first launch of a case (no times yet) are never touched."""
+    if args.get("overwrite"):
+        return ""
+    cmd = args.get("cmd") or ""
+    if phase_from_cmd(cmd)[0] != "solving":
+        return ""
+    case = case_dir_from_cmd(cmd, args.get("cwd") or ctx.home)
+    try:
+        text = ctx.backend.get_file(f"{case}/system/controlDict").decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001 - no controlDict: the solver will say so itself
+        return ""
+    control = parse_control_dict(text)
+    if control.get("startFrom") == "latestTime":
+        return ""
+    start = control.get("startTime") or 0.0
+    later = [t for t in _written_times(ctx, case) if t > start]
+    if not later:
+        return ""
+    return (
+        f"not started: {case} already holds {len(later)} written time step(s), from "
+        f"{later[0]:g} to {later[-1]:g}, and its controlDict says startFrom "
+        f"{control.get('startFrom') or 'startTime'} (startTime {start:g}). This launch would "
+        "start the solve again from there and write over them. To carry the run on from "
+        f"t={later[-1]:g} -- more time, a different writeInterval -- set `startFrom "
+        "latestTime;` in system/controlDict and start again (every write so far is kept). "
+        "To start over on purpose, call job_start with overwrite=true, or copy the case to "
+        "a new directory first so the finished results stay where they are."
+    )
 
 
 _EMPTY_PATCH = re.compile(r"^\s*type\s+empty\s*;", re.M)
@@ -622,13 +1468,20 @@ def _solve_shape(ctx: ToolContext, args: dict[str, Any]) -> str:
     `endTime` to speak of. A note that appears only sometimes is a note worth reading.
     """
     cmd = args.get("cmd") or ""
-    if phase_from_cmd(cmd)[0] != "solving":
+    phase, executable = phase_from_cmd(cmd)
+    if phase != "solving":
         return ""
+    # A steady solver's residuals on an unsteady flow level off and stay there, and a
+    # model not told to expect that read the plateau as a failed run in four studies
+    # of five (`convergence`). Said at the launch, because the residuals are the next
+    # thing it reads; said for steady solvers only, because a transient's per-step
+    # residuals do not have this shape.
+    steady = f" [{convergence.STEADY_LAUNCH_NOTE}]" if convergence.is_steady_solver(executable) else ""
     case = case_dir_from_cmd(cmd, args.get("cwd") or ctx.home)
     try:
         text = ctx.backend.get_file(f"{case}/system/controlDict").decode("utf-8", "replace")
     except Exception:  # noqa: BLE001 - a missing dict is not a failed launch
-        return ""
+        return steady
     control = parse_control_dict(text)
     parts = []
     end, every = control.get("endTime"), control.get("writeInterval")
@@ -644,9 +1497,20 @@ def _solve_shape(ctx: ToolContext, args: dict[str, Any]) -> str:
             # file that is actually on disk rather than the one that went past.
             span = end - (control.get("startTime") or 0.0)
             parts.append(f"deltaT {step:g} ({int(span / step)} steps at that timestep)")
+    # The two entries that decide whether a transient's results survive the NEXT
+    # launch, said at this one while they are still cheap to change: `startFrom
+    # latestTime` is what lets a run be carried on, and `purgeWrite N` throws away all
+    # but the last N writes as it goes -- a gif made from the "written" times finds N
+    # of them.
+    if control.get("startFrom"):
+        parts.append(f"startFrom {control['startFrom']}")
+    purge = control.get("purgeWrite")
+    if purge:
+        parts.append(f"purgeWrite {purge} (only the last {purge} write times are kept on disk)")
     parts.append(_load_per_rank(ctx, cmd, case))
     parts.append(_study_age(ctx))
-    return f" [{', '.join(p for p in parts if p)}]" if any(parts) else ""
+    shape = f" [{', '.join(p for p in parts if p)}]" if any(parts) else ""
+    return shape + steady
 
 
 def _study_age(ctx: ToolContext) -> str:
@@ -694,12 +1558,34 @@ def _load_per_rank(ctx: ToolContext, cmd: str, case: str) -> str:
         return ""
     ranks = _ranks_in(cmd)
     cells = _cell_count(ctx, case)
+    machine = _machine_line(ctx, ranks)
     if not cells:
-        return f"{ranks} rank(s), {cores} cores on this machine"
-    return (
-        f"{cells} cells on {ranks} rank(s) = {cells // ranks} each; "
-        f"{cores} cores on this machine"
-    )
+        return f"{ranks} rank(s), {machine}"
+    return f"{cells} cells on {ranks} rank(s) = {cells // ranks} each; {machine}"
+
+
+def _machine_line(ctx: ToolContext, ranks: int) -> str:
+    """Threads and cores, told apart.
+
+    `nproc` counts hardware threads, and the sentence "8 cores on this machine" was
+    built on it. On a machine with two threads a core that sentence is wrong by half,
+    and it cost a launch: told 8 cores, an agent decomposed for 6 ranks and Open MPI
+    refused the run -- "not enough slots" -- because its default slot count is the
+    PHYSICAL cores, four (study 20260920-161908-c7ef, c7i.2xlarge). The agent then
+    re-decomposed for 4. So both numbers are said, and what MPI will accept without
+    being told otherwise; the extra ranks a thread would add are named for what they
+    are, because a CFD solve is bound by memory bandwidth and two ranks on one core
+    share it."""
+    threads = ctx.cores or 0
+    physical = ctx.physical_cores or 0
+    if physical and physical < threads:
+        line = (f"{threads} hardware threads = {physical} physical cores on this machine; "
+                f"mpirun accepts up to {physical} ranks as it is (more needs "
+                "--use-hwthread-cpus, and ranks that share a core gain little in CFD)")
+        if ranks > physical:
+            line += f" -- {ranks} ranks is more than the {physical} cores"
+        return line
+    return f"{threads} cores on this machine"
 
 
 _MPIRUN_NP = re.compile(r"\bmpirun\b[^|;&]*?-np\s+(\d+)")
@@ -711,18 +1597,30 @@ def _ranks_in(cmd: str) -> int:
     return int(found.group(1)) if found else 1
 
 
+CORES_PROBE = (
+    "nproc; lscpu -p=CORE,SOCKET 2>/dev/null | grep -v '^#' | sort -u | wc -l"
+)
+"""Two numbers in one round trip: hardware threads, then distinct (core, socket) pairs
+from lscpu -- the physical cores. The second is 0 where lscpu is missing or refuses."""
+
+
 def _core_count(ctx: ToolContext) -> int:
-    """What `nproc` says, asked once per session.
+    """What `nproc` says, asked once per session, with the physical core count beside it.
 
     The count is a property of the container and does not change under us, so paying
     a round trip for it on every launch would be paying repeatedly for the same
-    answer. Zero means it could not be established, and nothing is said."""
+    answer. Zero means it could not be established, and nothing is said. Returns the
+    thread count (what `nproc` has always meant here); `ctx.physical_cores` holds the
+    other number for `_machine_line`."""
     if ctx.cores is None:
         try:
-            result = ctx.backend.exec("nproc", timeout_s=30)
-            ctx.cores = int((result.output or "").strip().split()[0])
+            result = ctx.backend.exec(CORES_PROBE, timeout_s=30)
+            fields = (result.output or "").split()
+            ctx.cores = int(fields[0])
+            ctx.physical_cores = int(fields[1]) if len(fields) > 1 and fields[1].isdigit() else 0
         except Exception:  # noqa: BLE001 - not knowing is not a failed launch
             ctx.cores = 0
+            ctx.physical_cores = 0
     return ctx.cores
 
 
@@ -737,21 +1635,20 @@ def _job_check(ctx: ToolContext, args: dict[str, Any]) -> str:
     wait_s = min(asked_wait, JOB_WAIT_MAX_S)
     waited_note = ""
     if wait_s > 0 and status.running:
-        began = time.monotonic()
-        while status.running and time.monotonic() - began < wait_s:
-            if ctx.on_wait_input is not None and ctx.on_wait_input():
-                break
-            remaining = wait_s - (time.monotonic() - began)
-            time.sleep(max(0.0, min(JOB_WAIT_POLL_S, remaining)))
-            status = ctx.backend.job_status(job_id)
-        waited_note = f"[waited {time.monotonic() - began:.0f}s]"
+        status, waited, heard, left = _hold(ctx, job_id, status, wait_s)
+        waited_note = f"[waited {waited:.0f}s]"
         if asked_wait > JOB_WAIT_MAX_S:
             waited_note += (
                 f" [wait_s={asked_wait} exceeds the {JOB_WAIT_MAX_S}s ceiling for "
                 "one call; waiting again is free]"
             )
-        if status.running and ctx.on_wait_input is not None and ctx.on_wait_input():
-            waited_note += " [the user said something, so this answered early]"
+        if left:
+            waited_note += " " + _left_note()
+        elif heard:
+            # Remembered from the loop rather than asked again here: the question
+            # drains the inbox, so a second asking would find it empty and drop the
+            # one sentence that explains a wait of 0 s.
+            waited_note += " " + _heard_note("job_check", "the job is still running")
     data, next_offset, eof = ctx.backend.job_tail(job_id, offset=offset)
     ctx.store.update_job(
         job_id,
@@ -767,10 +1664,56 @@ def _job_check(ctx: ToolContext, args: dict[str, Any]) -> str:
     if waited_note:
         header += " " + waited_note
     header += _running_on(ctx, record, status)
+    if record is not None:
+        sigpipe = _sigpipe_note(status.exit_code, record.cmd)
+        if sigpipe:
+            header += "\n" + sigpipe
+        felix = felix_job_summary(ctx.backend, record.cmd, record.cwd or ctx.home,
+                                  job_id, status.log_size)
+        if felix:
+            header += "\n" + "\n".join(felix)
     header += f"\nlog: bytes {offset}–{next_offset}, eof={eof}"
     if clipped:
         header += f" (this window clipped at {ctx.max_output} bytes; call again from {offset + len(body.encode('utf-8'))})"
     return f"{header}\n\n{body}" if body else header
+
+
+def _hold(ctx: ToolContext, job_id: str, status: JobStatus,
+          wait_s: float) -> tuple[JobStatus, float, bool, bool]:
+    """Watch a running job until it ends, `wait_s` runs out, or the person writes or
+    leaves. Returns the last status read, the seconds spent, and those two answers.
+
+    The one waiting loop behind a held `job_check` and a `bash` whose command became a
+    job (`_promoted`): the job is looked at every `JOB_WAIT_POLL_S`, and before each
+    pause the person is asked after. `_heard` drains the inbox, which is also how the
+    loop learns of a `/exit`; asked second, the leaving question sees one the drain
+    has just met. Both are handed back rather than asked again by the caller, because
+    the question drains the inbox and a second asking would find it empty -- and drop
+    the one sentence that explains a wait of 0 s. Leaving wins the caller's note:
+    words typed in the same breath as End ride with the result, but are not answered.
+    """
+    began = time.monotonic()
+    heard = left = False
+    looked = began
+    while status.running and time.monotonic() - began < wait_s:
+        heard = _heard(ctx)
+        left = _leaving(ctx)
+        if heard or left:
+            break
+        # The person is asked after every `INPUT_POLL_S`, the job only every
+        # `JOB_WAIT_POLL_S`: asking the loop costs nothing but a queue read, and a
+        # status is a round trip to the workspace. They used to be asked together,
+        # every five seconds -- now that nothing answers a message for the agent while
+        # it waits (the front desk is gone, and `/btw` is a side question that never
+        # reaches this thread), the seconds between a message and the agent reading it
+        # are the whole of the reply time, and a second is the price of a queue read.
+        remaining = wait_s - (time.monotonic() - began)
+        until_look = JOB_WAIT_POLL_S - (time.monotonic() - looked)
+        time.sleep(max(0.0, min(INPUT_POLL_S, until_look, remaining)))
+        if time.monotonic() - looked >= JOB_WAIT_POLL_S:
+            status = ctx.backend.job_status(job_id)
+            looked = time.monotonic()
+    return status, time.monotonic() - began, heard, left
 
 
 def _running_on(ctx: ToolContext, record: Any, status: JobStatus) -> str:
@@ -788,7 +1731,8 @@ def _running_on(ctx: ToolContext, record: Any, status: JobStatus) -> str:
     if not status.running or record is None:
         return ""
     cmd = getattr(record, "cmd", "") or ""
-    if phase_from_cmd(cmd)[0] != "solving":
+    if phase_from_cmd(cmd)[0] != "solving" or is_felix_solve(cmd):
+        # A Felix solve runs on a cloud GPU: the workspace's cores are not its cost.
         return ""
     load = _load_per_rank(ctx, cmd, case_dir_from_cmd(cmd, getattr(record, "cwd", "") or ctx.home))
     return f"\n{load}" if load else ""
@@ -814,73 +1758,352 @@ def _fetch(ctx: ToolContext, args: dict[str, Any]) -> str:
     return f"copied {len(written)} file(s) to the user's machine:\n{listing}"
 
 
-def _mesh(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
-    """The mesh desk's answer as one tool result: the picture first, the words second,
+GEOMETRY_SUFFIXES = (".step", ".stp", ".iges", ".igs")
+"""What the `geometry` property may name. B-rep, and nothing else: a `.stl` is
+triangles somebody already chose the size of, and the desk's whole first act on an
+imported file is choosing that size against the flow."""
+
+GEOMETRY_PROBE_BYTES = 1
+"""How much of the file is read to find out whether it can be read at all. The
+question is whether the volume will hand the bytes over, not what is in them."""
+
+
+def refuse_input(backend: Any, path: str, brep: bool = False) -> str | None:
+    """Why this path cannot be handed over, or None to go ahead.
+
+    Asked here rather than inside the desk, and before the desk is started, because
+    everything the desk does costs model time: a path with a typo in it discovered on
+    step nine is a refusal that took nine steps and a bill to write. This one costs a
+    `stat` and one byte.
+
+    **`brep` is about what is being asked for, not about what the file is.** A
+    `geometry` is "this is the part, prepare it", and a drawing cannot be that, so the
+    suffix list applies. An `input` is "here is something to work from", and nothing
+    about a PNG, a CSV of coordinates or a spec sheet makes it unusable -- the desk
+    opens it with a cell and finds out. A whitelist there would be the harness deciding
+    which kinds of work are possible, which is how a floorplan could not be handed over
+    at all.
+
+    The one byte is not a read of the file. It asks whether the volume will hand bytes
+    over, which a `stat` does not answer.
+    """
+    root = getattr(backend, "workspace_root", WORKSPACE_ROOT).rstrip("/")
+    what = "geometry file" if brep else "file"
+    if not path.startswith("/"):
+        return (f"{path} is not an absolute path; the {what} is named by its "
+                f"full path on the workspace, under {root}/")
+    if not (path == root or path.startswith(root + "/")):
+        return (f"{path} is not under {root}/, which is the only filesystem this "
+                "session can reach; there is no upload from your machine here")
+    suffix = path[path.rfind("."):].lower() if "." in path.rsplit("/", 1)[-1] else ""
+    if brep and suffix not in GEOMETRY_SUFFIXES:
+        return (f"{path} is not a CAD file this reads: the suffix is "
+                f"{suffix or 'absent'} and it takes one of "
+                f"{', '.join(GEOMETRY_SUFFIXES)}. A surface that is already triangles "
+                "is work for bash and the toolbox, not for this. To hand it over as "
+                "something to work from rather than as the part, pass it in `inputs`")
+    try:
+        info = backend.stat(path)
+    except BackendError as exc:
+        return f"{path} could not be read: {exc}"
+    except Exception as exc:  # noqa: BLE001 - the workspace answered badly; say which
+        return f"{path} could not be read: {type(exc).__name__}: {exc}"
+    if info.type == "directory":
+        return f"{path} is a directory, not a file"
+    if not info.size:
+        return f"{path} is empty (0 bytes), so there is nothing in it to work from"
+    try:
+        data = backend.get_file(path, offset=0, limit=GEOMETRY_PROBE_BYTES)
+    except BackendError as exc:
+        return f"{path} is there and could not be opened: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        return f"{path} is there and could not be opened: {type(exc).__name__}: {exc}"
+    if not data:
+        return f"{path} is there and gave back no bytes when it was read"
+    return None
+
+
+def _heard(ctx: ToolContext) -> bool:
+    """Whether the person has said something the model has not seen yet -- asked of the
+    loop, which drains the inbox to answer and holds the words for this batch's results
+    (`ToolContext.on_wait_input`, `Loop.heard`). False when nobody is wired to answer."""
+    return ctx.on_wait_input is not None and bool(ctx.on_wait_input())
+
+
+def _leaving(ctx: ToolContext) -> bool:
+    """Whether the person has ended the session -- asked of the loop, which learned it
+    from the same drain `_heard` runs (`ToolContext.on_leaving`, `Loop.leaving`). False
+    when nobody is wired to answer, so a wait with no session behind it holds as it
+    always did."""
+    return ctx.on_leaving is not None and bool(ctx.on_leaving())
+
+
+def _left_note() -> str:
+    """Why a held answer came back before its time when the person ended the session.
+
+    Says only what the tool knows: the wait ended because the person left, and the
+    session is on its way down. Not what becomes of the job or the desk -- the
+    close-down decides that (`cli._close_down`, `--keep-alive`), and the loop says the
+    rest in its own line right after this result (`loop.LEFT_MID_TURN`). The model is
+    not asked again, so this is for whoever reads the transcript."""
+    return "[the person ended the session, so this answered early; the session is closing down]"
+
+
+def _heard_note(again: str, still: str, *, then: str | None = None) -> str:
+    """Why a held answer came back before its time, and what comes next.
+
+    Three facts, because a wait cut short with fewer read as a tool that does not
+    wait: the person wrote (the reason); their words are in this same message, after
+    the tool results (where to look -- the loop puts them there, `Loop._turns`); and
+    what was being waited on is still going, so the same call, made again after
+    answering them, holds as it did. Measured without the last two (study
+    20260921-033019-e1b4): three returns in nine seconds saying only "the user said
+    something", no words following, and the model switched to `bash sleep 115` for
+    the rest of the study.
+
+    `then` replaces "call {again} again" where the same call is the wrong next step:
+    a `bash` whose command became a job is followed with `job_check`, because `bash`
+    again would run the command a third time."""
+    then = then or f"call {again} again"
+    return (f"[the person wrote, so this answered early; their words follow this result. "
+            f"Answer them, then {then} -- {still}]")
+
+
+def _cad(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+    """The CAD desk's answer as one tool result: the picture first, the words second,
     so that when the picture is later evicted from the thread the caption still carries
     the patch table, the verdict and where the case is."""
-    if ctx.mesher is None:
+    if ctx.cad is None:
         return (
-            "the mesh desk is not available in this session (it needs a model key of "
-            "its own to run); meshing here is yours to do with bash like anything else"
+            "the CAD desk is not available in this session (it needs a model key of "
+            "its own to run); geometry and meshing here are yours to do with bash "
+            "like anything else"
         )
-    result = ctx.mesher.run(str(args.get("request", "")), case=args.get("case"))
+    geometry = str(args.get("geometry") or "").strip()
+    if geometry:
+        refusal = refuse_input(ctx.backend, geometry, brep=True)
+        if refusal:
+            # Nothing has started: no kernel, no thread, no model call. The path and
+            # what is wrong with it are the whole answer.
+            return f"nothing was run: {refusal}"
+    inputs: list[str] = []
+    for item in (args.get("inputs") or []):
+        path = str(item or "").strip()
+        if not path or path == geometry:
+            continue
+        refusal = refuse_input(ctx.backend, path)
+        if refusal:
+            return f"nothing was run: {refusal}"
+        inputs.append(path)
+    result = ctx.cad.run(str(args.get("request", "")), case=args.get("case"),
+                         geometry=geometry, inputs=inputs)
     if ctx.on_tokens and result.tokens:
         ctx.on_tokens(result.tokens)
-    text = mesh_text(result)
-    if result.png:
-        return [images.attachment(images.downscale(result.png, "image/png"), "image/png"),
+    text = cad_text(result)
+    # The picture: the desk's own when it drew one, else the reviewer's first view.
+    # `CoreDesk` never draws at the finish, so without this the caller of the measured
+    # desk got words about a shape and no shape.
+    png = result.png
+    if not png:
+        review = getattr(result, "review", None)
+        png = getattr(review, "png", None) if review is not None else None
+    if png:
+        return [images.attachment(images.downscale(png, "image/png"), "image/png"),
                 {"type": "text", "text": text}]
     return text
 
 
-def mesh_text(result: Any) -> str:
-    """The words of the mesh tool's answer: whether it is a mesh, what the mesh is,
-    what the desk says it built, what is still to do, and how to change it.
+BUDGET_STOPS = ("steps", "time", "provider")
+"""The `CadResult.stopped` values that mean the desk did not finish on its own terms.
+A mesh accepted at the end of one of those runs was checked and never reviewed, and
+`cad_text` says so rather than leaving the review line out as if nobody had one."""
+
+NOT_REVIEWED_BUDGET = "not reviewed: the desk ran out of budget before it could be reviewed"
+
+
+def cad_text(result: Any) -> str:
+    """The words of the CAD tool's answer: whether it is a mesh, what the mesh is,
+    what an independent reviewer made of the shape, what the desk says it built,
+    what is still to do, and how to change it.
 
     The order is deliberate. A tool result that opened with "case written" was once
     read as "meshed" and the solve that followed had nothing to solve, so the first
-    line here is always the state of `constant/polyMesh` and never anything else.
+    line here is always the state of `constant/polyMesh` and never anything else. The
+    review comes second, because it is the one judgement about the *shape* -- and a
+    mesh that passed checkMesh and did not pass review is the case the reviewer
+    exists for (`cad/review.py`).
     """
     check = result.check
     lines: list[str] = []
     if result.error and not result.ok:
-        lines.append(f"the mesh desk stopped: {result.error}")
+        lines.append(f"the CAD desk stopped: {result.error}")
     elif result.error:
-        lines.append(f"the mesh desk stopped ({result.error}) -- but the mesh it had "
+        lines.append(f"the CAD desk stopped ({result.error}) -- but the mesh it had "
                      "already built is there and passes:")
     if result.ok and check is not None:
         lines.append(f"meshed: {result.case_rel}/constant/polyMesh is an OpenFOAM mesh "
                      "and checkMesh passes on it.")
+    elif check is not None and check.unreachable:
+        # Nothing is known: the workspace did not answer. Three runs had a finished
+        # mesh described as missing because a container recycled while it was being
+        # checked, and the caller believed it.
+        lines.append(
+            f"the mesh in {result.case_rel} could NOT BE CHECKED -- the workspace did "
+            f"not answer ({result.check.error}). This is not a statement about the "
+            "mesh: a container that recycles mid-run comes back and the Volume under "
+            f"it keeps the files, so look for yourself with `python3 "
+            f"{WORKSPACE_ROOT}/.toolbox/mesh_look.py {result.case_rel} --out look.png` "
+            "before building anything again.")
     elif check is not None and check.missing:
         why = "; ".join(check.missing)
         lines.append(f"NOT a usable mesh yet in {result.case_rel}: {why}")
     else:
         lines.append(f"nothing was meshed in {result.case_rel}")
+    review = getattr(result, "review", None)
+    if review is not None:
+        lines.extend(review.lines())
+    elif result.ok and getattr(result, "stopped", "") in BUDGET_STOPS:
+        # The end-of-run check accepted what was there; nobody but the desk looked at
+        # the shape. Said, because a missing line reads as a clean bill.
+        lines.append(NOT_REVIEWED_BUDGET)
     if getattr(result, "remarks", None):
         lines.append("")
-        lines.append("while this ran, the user said this to the mesh desk directly, and it "
+        lines.append("while this ran, the user said this to the CAD desk directly, and it "
                      "worked to it:")
         lines.extend(f'  "{remark}"' for remark in result.remarks)
     if result.summary:
         lines.append("")
-        lines.append("the mesh desk says:")
+        lines.append("the CAD desk says:")
         lines.extend(f"  {line}" for line in result.summary.splitlines())
     if check is not None and check.lines():
         lines.append("")
         lines.extend(check.lines())
     lines.append("")
-    lines.append(_mesh_accounting(result))
+    lines.append(_cad_accounting(result))
     lines.append(
         f"this is a mesh and nothing else: no 0/ fields, no boundary conditions, no "
         f"solver settings, nothing solved. Look at it again yourself with "
         f"`python3 {WORKSPACE_ROOT}/.toolbox/mesh_look.py {result.case_rel} --out look.png`, "
-        f"rebuild it after an edit with `cd {result.case_rel} && sh Allmesh`, or call this "
-        "tool again with what to change."
+        f"rebuild it after an edit with `cd {result.case_rel} && sh Allmesh`, call "
+        "mesh_review to have it looked at again independently, or call this tool again "
+        "with what to change."
     )
     return "\n".join(lines)
 
 
-def _mesh_accounting(result: Any) -> str:
+REVIEW_IS_AN_OPINION = (
+    "this is an independent opinion about the shape and nothing else: no checkMesh ran "
+    "here and nothing about the mesh was changed"
+)
+
+REVIEW_FAILED_NEXT = (
+    "fix the shape and call this again, or hand the problems to the cad tool with what "
+    "to change"
+)
+
+
+def _mesh_review(ctx: ToolContext, args: dict[str, Any]) -> ToolResult:
+    """A second pair of eyes on a mesh that already exists, wherever it came from.
+
+    The same `Reviewer` the desk consults at its finish, reached without the desk: the
+    caller names a case and says what the shape is meant to be, and gets back the
+    verdict and the first view. Nothing here opens the mesh -- the rendering runs where
+    the mesh is (`Reviewer._render`) -- and nothing here judges it; the words are the
+    reviewer's, and the two lines after them say what kind of answer this is.
+
+    The path is checked before anything is spent, on the `refuse_input` argument: a
+    directory that is not there is worth a `stat`, not a render and a model call. It
+    has to be under the workspace root, because that is the only filesystem the
+    reviewer can render from; a relative name is under this study's own directory,
+    which is where the desk puts what it builds.
+    """
+    if ctx.reviewer is None:
+        return (
+            "the independent reviewer is not available in this session (it needs a "
+            "model key of its own to look with); look at the mesh yourself with "
+            f"`python3 {WORKSPACE_ROOT}/.toolbox/mesh_look.py <case> --out look.png` "
+            "and read_file the picture"
+        )
+    request = str(args.get("request") or "").strip()
+    if not request:
+        return ("nothing was reviewed: say what the geometry is supposed to be in "
+                "`request` -- the reviewer compares the pictures to that and to nothing "
+                "else")
+    resolved = _case_under_workspace(ctx, str(args.get("case") or ""))
+    if isinstance(resolved, str):
+        return f"nothing was reviewed: {resolved}"
+    case_dir, case_rel = resolved
+    try:
+        info = ctx.backend.stat(case_dir)
+    except BackendError as exc:
+        return f"nothing was reviewed: {case_dir} could not be read: {exc}"
+    if not info.is_dir:
+        return f"nothing was reviewed: {case_dir} is a file, not a case directory"
+    try:
+        ctx.backend.stat(f"{case_dir}/constant/polyMesh")
+    except BackendError as exc:
+        return (f"nothing was reviewed: {case_dir} holds no constant/polyMesh, so there "
+                f"is no mesh to look at ({exc})")
+
+    review = ctx.reviewer.review(case_dir, case_rel, request, said=None,
+                                 summary=str(args.get("notes") or "").strip(),
+                                 facts=None)
+    if ctx.on_tokens and getattr(review, "tokens", None):
+        ctx.on_tokens(review.tokens)
+    text = mesh_review_text(review)
+    png = getattr(review, "png", None)
+    if png:
+        return [images.attachment(images.downscale(png, "image/png"), "image/png"),
+                {"type": "text", "text": text}]
+    return text
+
+
+def mesh_review_text(review: Any) -> str:
+    """The reviewer's own report, then what kind of answer it is and what follows it."""
+    lines = list(review.lines())
+    lines.append("")
+    lines.append(REVIEW_IS_AN_OPINION)
+    blocks = getattr(review, "blocks_finish", None)
+    if callable(blocks) and blocks():
+        lines.append(REVIEW_FAILED_NEXT)
+    return "\n".join(lines)
+
+
+def _case_under_workspace(ctx: ToolContext, case: str) -> tuple[str, str] | str:
+    """The case directory as an absolute workspace path, with its name relative to the
+    study -- or the sentence saying why the path cannot be used.
+
+    The rule is `refuse_input`'s: under the workspace root, or nowhere. A relative name
+    is taken under this study's own directory (`ctx.home`), and a `..` that climbs out
+    of the root is refused by the same test after `normpath` has folded it -- the check
+    is on where the path lands, not on how it was spelled."""
+    root = str(getattr(ctx.backend, "workspace_root", WORKSPACE_ROOT)).rstrip("/") or "/"
+    raw = case.strip()
+    if not raw:
+        return ("say which case to look at in `case`: the directory holding "
+                "constant/polyMesh, relative to this study or absolute under "
+                f"{root}/")
+    home = (ctx.home or root).rstrip("/") or root
+    path = posixpath.normpath(raw if raw.startswith("/") else f"{home}/{raw}")
+    if not (path == root or path.startswith(root + "/")):
+        return (f"{path} is not under {root}/, which is the only filesystem this "
+                "session can reach; there is no upload from your machine here")
+    if path == home:
+        case_rel = "."
+    elif path.startswith(home + "/"):
+        case_rel = path[len(home) + 1:]
+    else:
+        case_rel = path
+    return path, case_rel
+
+
+mesh_text = cad_text
+"""The name this was called while the desk was called `mesher`. Kept because
+`cad/check.py`'s tests render a `Check` through it, and a rename of a private
+formatter is not worth a test edit in a file this chunk does not own."""
+
+
+def _cad_accounting(result: Any) -> str:
     steps = len(getattr(result, "steps", []) or [])
     line = f"{steps} step{'s' if steps != 1 else ''}, {result.seconds / 60:.1f} min"
     if result.stopped == "steps":
@@ -891,15 +2114,62 @@ def _mesh_accounting(result: Any) -> str:
         line += "; the model call failed, so this is where it got to"
     return line
 
+def _checkpoint(ctx: ToolContext, args: dict[str, Any]) -> str:
+    """Ask the person, and hand back their answer as a fact.
+
+    Approval is recorded on the context, because structured mode holds `job_start`
+    until a plan has been approved (`Loop._consult`). Anything but an approval
+    carries the person's own words back as the changes they asked for."""
+    stage = str(args.get("stage") or "").strip() or "plan"
+    summary = str(args.get("summary") or "").strip()
+    after = str(args.get("next") or "").strip()
+    if ctx.mode != "structured":
+        return (f"Checkpoints apply only in structured mode, and this session is in "
+                f"{ctx.mode} mode, so nothing was put to the person. They can switch "
+                "with /mode structured.")
+    if ctx.approver is None:
+        return "Nobody is here to answer, so this checkpoint was not put to anyone."
+    detail = summary + (f"\n\nnext: {after}" if after else "")
+    decision = ctx.approver.ask("checkpoint", f"Checkpoint: {stage}", detail)
+    if decision.approved:
+        ctx.plan_approved = True
+        text = f"The person approved the {stage} checkpoint. Carry on with: {after or 'the next stage'}"
+        if decision.all and ctx.on_mode is not None:
+            ctx.on_mode("auto")
+            text += ("\nThey also asked not to be asked again: the session is now in full "
+                     "auto mode and no further checkpoints are put to them.")
+        return text
+    if decision.note:
+        return (f"The person did not approve the {stage} checkpoint. The changes they "
+                f"asked for, in their words: {decision.note}")
+    return f"The person did not approve the {stage} checkpoint and gave no reason."
+
+
+def _send_to_agent(ctx: ToolContext, args: dict[str, Any]) -> str:
+    """`send_to_agent` called by the main agent itself, which has nobody to send to.
+
+    The tool exists for the side chat (`desk.SideChat`), which answers a `/btw` question
+    by sending the main agent's own last request again with one message appended. For
+    that request to read the main conversation from the prompt cache, its tool list has
+    to be the main one, byte for byte -- so the side chat's one tool of its own is in
+    the main list from the start of every session, and stays there. Here, called in
+    the main conversation, it is answered as what it is."""
+    del ctx, args
+    return ("send_to_agent is only for answering a side question (/btw), and none is "
+            "being asked: nothing was sent. You are the agent it would send to.")
+
 
 _HANDLERS: dict[str, Callable[[ToolContext, dict[str, Any]], ToolResult]] = {
     "bash": _bash,
+    "cad": _cad,
+    "checkpoint": _checkpoint,
     "fetch": _fetch,
-    "mesh": _mesh,
     "job_check": _job_check,
     "job_kill": _job_kill,
     "job_start": _job_start,
+    "mesh_review": _mesh_review,
     "read_file": _read_file,
+    "send_to_agent": _send_to_agent,
     "write_file": _write_file,
 }
 
@@ -949,7 +2219,21 @@ def describe_job(status: Any) -> str:
         parts.append(running_for)
     line = " ".join(parts)
     if status.killed_by:
-        line += f"\nmatched kill_on line: {status.killed_by.strip()}"
+        # Not "matched kill_on line" any more. That label was right for as long as
+        # a `kill_on` regex was the only thing that ever wrote `killed_by`; F-48
+        # made the service write it on every terminal state that is a kill, from
+        # six producers, and only one of them is a log line. The others are
+        # sentences: the container was gone, the process group was gone, the state
+        # could not be read, a client sent a signal. Keeping the old label would
+        # have told the model that a container which vanished was a regex match --
+        # a wrong label on the one field that exists to stop it guessing why its
+        # solve died, which is the whole of F-48.
+        #
+        # `end_reason` already says which kind this is (`kill_on_match` for the
+        # log line), so this does not repeat it and does not parse the text: the
+        # service's wording changes with what it can measure, and it is meant to
+        # be read rather than matched on.
+        line += f"\nwhy it ended: {status.killed_by.strip()}"
     return line
 
 

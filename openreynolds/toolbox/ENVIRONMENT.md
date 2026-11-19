@@ -32,6 +32,13 @@ One interpreter, and `python3` in a shell is it — the one the renderers use. I
   and extrudes it one cell thick into hexahedra with the two z faces typed `empty`, which is
   how a plane case is meshed here. Name a physical group per surface as you build it and the
   patch names come out of the geometry rather than out of where a face happens to sit.
+- **ipykernel** and **jupyter_client** — an IPython kernel and the client that talks to
+  one. This is what the `cad` tool's desk works in: a kernel started in the case
+  directory that stays up for a run, so a B-rep costs a minute once instead of once per
+  question asked of it, and so a figure a cell draws comes back as the picture rather
+  than as a filename somebody had to remember to save. Nothing needs to be arranged to
+  use them from a shell either: `python3 -m ipykernel` is here, and `jupyter_client`'s
+  `KernelManager` starts the `python3` kernel spec.
 - **build123d** — parametric CAD in readable Python on the same OpenCASCADE kernel (via OCP):
   `Cylinder(5, 40) - Cylinder(4, 40)` is a penne, `export_step(part, "body.step")` writes the
   B-rep gmsh imports with `merge`/`importShapes` and meshes. This is the editable layer: a
@@ -39,8 +46,23 @@ One interpreter, and `python3` in a shell is it — the one the renderers use. I
 - `mesh_look.py` in the toolbox draws any meshed case with one colour per patch and prints
   its cells, bounds, patch areas and normals and checkMesh's verdict — the fastest way to
   see whether a mesh is the shape that was meant and whether the inlet is the end you think.
+- `templates/` in the toolbox holds two working scripts, not snippets: `duct2d.py` (a
+  closed planar outline meshed in quads, extruded one cell into hexahedra, converted with
+  `gmshToFoam` and retyped) and `body_in_box.py` (an OCC primitive cut out of a flow box,
+  meshed body-fitted with tetrahedra, converted and retyped). Both run `checkMesh` and end
+  with a `mesh_look.py` call. Copy one into a case directory, edit the two numbers marked
+  at the top, and run it — the whole 2D or 3D meshing recipe, gotchas included, rather
+  than a page to reconstruct from memory.
 
 Not installed: **scipy**, **PyMuPDF/`fitz`**. For PDFs use the poppler tools below, not `fitz`.
+
+## OpenFOAM dictionaries
+
+Hand-written dictionaries can start directly with `FoamFile`; the large decorative
+OpenFOAM C++ banner above it is optional. A partial decorative banner is not harmless:
+if its opening `/*...` is copied without the matching closing line, OpenFOAM reads the
+dictionary as a comment and reports that the `FoamFile` token is missing. Omit the
+banner unless copying a complete known-good file.
 
 ## Binaries on PATH
 
@@ -61,6 +83,31 @@ Not installed: **scipy**, **PyMuPDF/`fitz`**. For PDFs use the poppler tools bel
 The image runs as **root**. Long work belongs in a **job** (`job_start`), which is detached
 and survives; a synchronous `bash` command that runs past ~150 s is cut off at the edge, so
 mesh, solve and `reconstructPar` on a real case belong in a job, not a foreground exec.
+Do not redirect a job's stdout or stderr (`> log.*`, `2>&1`, `| tee`): the job already
+captures both, and `job_start` will refuse a redirected command.
 
 See `README.md` for the scripts that already do the common jobs (rendering, animation,
 geometry views, case generation, digests) — most of what gets written by hand is in there.
+
+## The three scripts every study reaches for
+
+Their flags, so the first call is the real one (two studies in a row spent a round trip
+on `render.py --help` before rendering anything):
+
+- `python3 /work/.toolbox/render.py <case> [--scene all|mesh|fields] [--fields U p vorticity]
+  [--time T] [--normal z] [--zoom F | --bounds xmin xmax ymin ymax zmin zmax] [--out DIR]`
+  — fixed-camera PNGs of the mesh cut and field slices; `--out` defaults to `<case>/renders`;
+  without `--time` the latest time is drawn.
+- `python3 /work/.toolbox/mesh_look.py [<case>] [--out look.png] [--json measured.json]
+  [--no-check]` — one captioned picture of a mesh plus its measured bounds, cell count and
+  patch table; runs `checkMesh` unless told not to. A relative `--out` (and `--json`) is
+  relative to the directory you run it from, as for every script here — not to the case —
+  and without `--out` the picture is `<case>/look.png`; the report's `picture:` line is the
+  absolute path it wrote.
+- `python3 /work/.toolbox/results.py <case> [--preset NAME | --list] [--time latest|first|T]
+  [--normal z] [--out DIR]` — the preset picture and plot set and a `results.md` from a
+  finished case; `--out` defaults to `<case>/results`.
+
+A decomposed run's time steps live in `processorN/` (or `processors<N>/` with the collated
+handler) until `reconstructPar` puts them together; `reconstructPar -latestTime` reconstructs
+one time, and a series (an animation) needs `reconstructPar` without it, or `-time 'a:b'`.

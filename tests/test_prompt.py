@@ -8,10 +8,13 @@ reviewed by memory.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 import pytest
 
 from openreynolds.prompt import SYSTEM_PROMPT, system_prompt
+
+TOOLBOX = Path(__file__).resolve().parents[1] / "openreynolds" / "toolbox"
 
 IMPERATIVE_PATTERNS = [
     r"\balways\b",
@@ -74,10 +77,44 @@ def test_prompt_says_where_honesty_is_expected():
     assert "did not verify" in SYSTEM_PROMPT
 
 
+def test_honesty_is_a_fact_about_the_number_not_a_verdict_on_the_run():
+    """The sentence used to lead with "an unconverged solve" as the first thing to
+    confess to, and four studies in five answered it with a bold "Honesty: the run did
+    not converge" about a residual levelled off on a shedding wake -- the physics, not
+    a defect (`openreynolds/convergence.py` has them). The expectation stands; the
+    example that framed a stall as a confession is gone."""
+    assert "unconverged" not in SYSTEM_PROMPT
+    assert "a fact about it and not a verdict on the run" in SYSTEM_PROMPT
+    assert "a run still moving when its number was read" in SYSTEM_PROMPT
+
+
+# What the prompt could offer without naming the script that does it, and that script.
+# Each word is fine in the prompt once its script is in the toolbox.
+CAPABILITY_SCRIPTS = {"search": "search.py", "corpus": "corpus.py"}
+
+
 def test_prompt_does_not_promise_tools_the_image_lacks():
-    """The A4 run wasted a detour on foamToC, which the prompt claimed was there."""
+    """The A4 run wasted a detour on foamToC, which the prompt claimed was there.
+
+    It came back with search (#27). The prompt said the rest of the volume was
+    "searchable alongside the tutorials" -- the corpus index and its query script on
+    `pr22-corpus` -- on a `main` that had neither, and this guard, checking only the
+    foamToC strings, passed. So a script the prompt names has to be in the toolbox, and
+    so does the script behind something it offers without naming one; once that script
+    lands, the word is allowed back.
+    """
     assert "`foamToC` is available" not in SYSTEM_PROMPT
     assert "not** in this image" in SYSTEM_PROMPT or "not in this image" in SYSTEM_PROMPT
+    for name in re.findall(r"[\w-]+\.py\b", SYSTEM_PROMPT):
+        assert (TOOLBOX / name).is_file(), (
+            f"the prompt names {name}, and there is no such script in the toolbox"
+        )
+    for word, script in CAPABILITY_SCRIPTS.items():
+        said = re.search(rf"\b{word}\w*", SYSTEM_PROMPT, re.IGNORECASE)
+        if said:
+            assert (TOOLBOX / script).is_file(), (
+                f"the prompt says {said.group(0)!r}, and the toolbox has no {script}"
+            )
 
 
 def test_prompt_says_mpi_is_already_arranged():
@@ -104,3 +141,183 @@ def test_the_prompt_says_a_study_has_a_directory_of_its_own():
     assert "its own directory" in SYSTEM_PROMPT
     assert "briefing names" in SYSTEM_PROMPT
     assert "empty one" in SYSTEM_PROMPT
+
+
+# -- Felix mode (docs/felix-mode-acceptance.md, A2) ------------------------------
+
+OPENFOAM_PROMPT_SHA256 = "af9b71bfa094e23ebef344dbf29d657b3d82ca751e8db10ce7d7c0b840d1f6e0"
+"""The OpenFOAM prompt, pinned. It is the cache prefix of every OpenFOAM study, so it
+moves only on purpose: not for a second solver (Felix mode left it byte-identical),
+when the "searchable" claim with no search tool behind it came out (#27), and last
+when it came to say that no cost in money is told to the user (plans are sold as
+studies; `job_start` lost `estimate_usd` in the same change, so the prefix moved
+anyway)."""
+
+
+def test_neither_prompt_invites_the_model_to_tell_the_user_a_cost():
+    """What the hosted service costs is never shown to the person, and the model is
+    one way it could reach them: Felix's GPU list and a solve's status carry dollars."""
+    assert "No cost in money is said to them." in SYSTEM_PROMPT
+    assert "No cost in money is said to them." in _felix()
+    assert "prices are for choosing, not for telling" in _felix()
+
+
+def test_the_openfoam_prompt_moves_only_on_purpose():
+    import hashlib
+
+    assert hashlib.sha256(SYSTEM_PROMPT.encode("utf-8")).hexdigest() == OPENFOAM_PROMPT_SHA256
+    assert system_prompt() == system_prompt("openfoam") == SYSTEM_PROMPT
+
+
+def _felix():
+    from openreynolds.prompt import FELIX_PROMPT
+
+    return FELIX_PROMPT
+
+
+def test_a_felix_study_gets_the_felix_prompt():
+    assert system_prompt("felix") == _felix()
+    assert _felix() != SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize("pattern", IMPERATIVE_PATTERNS)
+def test_the_felix_prompt_mandates_no_workflow(pattern):
+    match = re.search(pattern, _felix(), re.IGNORECASE)
+    assert match is None, f"imperative workflow language in the Felix prompt: {match!r}"
+
+
+def test_the_felix_prompt_is_short():
+    assert len(_felix()) < 6000
+
+
+def test_the_felix_prompt_is_frozen():
+    assert system_prompt("felix") is system_prompt("felix")
+    for volatile in ("instance_id", "{", "}"):
+        assert volatile not in _felix()
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [r"\d{8}-\d{6}-[0-9a-f]{4}", r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}", r"\b20\d\d-\d\d-\d\d\b"],
+)
+def test_nothing_per_session_is_baked_into_the_felix_prompt(shape):
+    assert re.search(shape, _felix()) is None
+
+
+@pytest.mark.parametrize(
+    "fact",
+    [
+        "/opt/felix/docs",          # the reference, pointed at rather than copied
+        "case.yaml",                # a case is a directory of YAML files
+        ".vtu",                     # plus a tagged mesh
+        "felix-tag-mesh",
+        "felix-check-mesh",
+        "felix gpus",               # GPU types and prices come from the service
+        "gpu_sizing.md",
+        "felix run",
+        "--gpu",
+        "--wall",
+        "felix continue",
+        "job_start",
+        "output.every",             # every solve snapshots
+        "ERROR:",
+        "WARNING:",
+        "NOTE:",
+        "step=",
+        "stdout",
+        "stderr",
+        "summary.json",
+        "out of GPU memory",
+        "output.previous",          # what `felix run` does with an earlier output/
+        "usd_per_hour",             # what `felix gpus` answers
+        "402 allowance_exhausted",  # a refusal by the service: the allowance is spent
+        "403 plan_limit",           # the plan does not allow that GPU
+        "409 study_paused",         # the study met its ceiling
+        "warm_start",               # what `felix continue` rewrites
+        "FELIX_",                   # the mesh tools refuse to run with one set
+        "/work",
+        "did not verify",
+    ],
+)
+def test_the_felix_prompt_states_what_the_model_needs(fact):
+    assert fact in _felix()
+
+
+def test_the_felix_prompt_states_the_exit_codes():
+    text = _felix()
+    for code in ("0", "1", "2"):
+        assert re.search(rf"\b{code}\b", text)
+    assert "refused" in text
+
+
+def test_the_felix_prompt_carries_no_prices():
+    """Prices change and live in the service (`felix gpus`); a number here is stale."""
+    assert "$" not in _felix()
+    assert not re.search(r"\d+(\.\d+)?\s*/\s*h(ou)?r", _felix())
+
+
+def test_the_felix_prompt_says_nothing_of_openfoam_tooling():
+    for openfoam in ("blockMesh", "controlDict", "decomposePar", "mpirun", "v2512",
+                     "latestTime", "`cad`", "mesh_review", "case_gen"):
+        assert openfoam not in _felix(), openfoam
+    assert "honesty" in _felix().lower() or "did not verify" in _felix()
+
+
+# -- before the solver is chosen (`--solver auto`) ------------------------------
+#
+# There is no prompt for a study still choosing any more: the choice is made by a
+# request of its own before the main agent's first (`desk.route`), and the main agent
+# starts on its solver's prompt. What the choosing prompt said about the two solvers
+# now lives in the routing request's prompt, and is held to the same facts here.
+
+
+def _choosing():
+    from openreynolds.desk import ROUTING_SYSTEM
+
+    return ROUTING_SYSTEM
+
+
+def test_a_study_with_no_solver_yet_is_never_sent_a_prompt_of_its_own():
+    """`auto` is settled before any request; asked anyway, it is OpenFOAM's prompt --
+    never a third prompt that a later request would have to swap out."""
+    assert system_prompt("auto") is SYSTEM_PROMPT
+    from openreynolds import prompt
+
+    assert not hasattr(prompt, "SOLVER_CHOICE_PROMPT")
+
+
+@pytest.mark.parametrize("pattern", IMPERATIVE_PATTERNS)
+def test_the_choosing_prompt_mandates_no_workflow(pattern):
+    match = re.search(pattern, _choosing(), re.IGNORECASE)
+    assert match is None, f"imperative workflow language in the choosing prompt: {match!r}"
+
+
+def test_the_choosing_prompt_is_short_and_frozen():
+    assert len(_choosing()) < 6000
+    for volatile in ("instance_id", "{", "}"):
+        assert volatile not in _choosing()
+
+
+@pytest.mark.parametrize(
+    "fact",
+    [
+        "choose_solver",
+        "OpenFOAM",
+        "Felix",
+        "incompressible",       # what Felix solves
+        "Spalart-Allmaras",     # its one turbulence model
+        "Boussinesq",           # its energy equation
+        "compressible",         # what it does not
+        "multiphase",
+        ".vtu",                 # its mesh
+        "GPU",
+        "billed",
+        "holds for the whole study",  # the choice does not change
+    ],
+)
+def test_the_choosing_prompt_says_what_each_solver_can_do(fact):
+    assert fact in _choosing()
+
+
+def test_the_choosing_prompt_carries_no_prices():
+    assert "$" not in _choosing()

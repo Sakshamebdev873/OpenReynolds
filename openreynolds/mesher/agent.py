@@ -18,6 +18,7 @@ Three things it does own, because they are what the model cannot check about its
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import time
@@ -25,23 +26,28 @@ from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from .. import images
-from ..llm import Listener, ProviderError, make_provider
+from ..llm import Listener, ProviderError, endpoint_key, make_provider
 from .brief import MESH_DONE, remark_message, system_prompt, task_message
-from .check import Check, verify
+from .check import LOOK, Check, verify
+
+SNAPSHOT_REL = "renders/mesh_before.json"
+"""Where the pre-run measurement is kept. Beside the render the check writes, so a
+case directory still holds exactly one place for what the desk measured."""
 
 MAX_STEPS = 30
 """Enough for a shape, a look, two or three revisions, a refine and a finish. A run
 that has not converged by here is not one step from converging."""
 
-MAX_SECONDS = 1200.0
-"""Twenty minutes, and the step count is the real bound.
+MAX_SECONDS = 900.0
+"""Fifteen minutes, and it was briefly twenty, which the measurement then argued back.
 
-Measured over the six acceptance runs: five desks finished in 1.9 to 5.2 minutes, and
-the Tesla valve -- the request with the most clauses in it -- was still working at
-fourteen. A lap is 30-40 s and a meshing command can be minutes, so at fifteen the
-clock was cutting a run whose own step budget was nowhere near spent. What should stop
-a run is thirty commands without an answer, not a mesh that takes three minutes to
-build."""
+Every desk that succeeded finished inside eleven minutes -- 1.9 to 5.2 across the six
+2D and 3D acceptance runs, 10.6 for the aerofoil, which is the longest success on
+record. The one that failed ran 942 s and eight commands and produced nothing at all.
+So past roughly ten minutes this desk is not slow, it is stuck, and the cheapest thing
+to do with the caller's time is give it back: the caller has bash, the templates and
+`mesh_look.py`, and on the hardest prompt measured it did better with them than the
+desk did (`qa-runs/AB-MESH-TOOL.md`)."""
 
 STEP_TIMEOUT_S = 240
 """One command. Longer work goes in the background and is polled -- the brief says so."""
@@ -65,6 +71,16 @@ a 401 says the same thing twice."""
 
 RETRY_PAUSE_S = 5.0
 
+NUDGE_AT_STEP = 12
+"""When to say out loud that there is still no mesh.
+
+The failure this addresses, measured: on the hardest prompt the desk spent its whole
+budget deriving tangent geometry in closed form and never ran a mesher at all -- 942 s,
+eight commands, nothing on disk. Meanwhile the same model with bash alone built the
+correct shape by drawing small numbered scripts and checking each one. A desk that has
+not meshed anything after a dozen commands is answering the wrong question, and the
+answer is not more thinking, it is a coarse mesh to look at."""
+
 KEEP_IMAGES = 2
 """Pictures kept in the thread. Older observations keep their words and lose their
 image: a render is 800-1300 tokens and the fifth-oldest one is answering a question
@@ -79,7 +95,9 @@ class Step:
     """One lap, as the record keeps it."""
 
     cmd: str
-    exit_code: int
+    exit_code: int | None
+    """None when the workspace moved the command to a detached job before it ended
+    (`ExecResult.promoted`): there is no exit code yet, and the job has it."""
     seconds: float
     output: str = ""
     image: str = ""
@@ -115,8 +133,13 @@ class Mesher:
 
     def __init__(self, cfg: Any, backend: Any, store: Any, home: str,
                  on_step: Callable[[Step], None] | None = None,
-                 interject: Callable[[], str | None] | None = None):
+                 interject: Callable[[], str | None] | None = None,
+                 headers: dict[str, str] | None = None):
         self.cfg = cfg
+        self.headers = dict(headers or {})
+        """Sent on every model request: the session's `X-Study-Id`, so the service bills
+        the mesher's calls to the study and judges them against its ceiling. A trial
+        account's call without it is refused (foamd `trial_needs_study`)."""
         self.backend = backend
         self.store = store
         """The session's transcript, read for what the person actually said."""
@@ -128,15 +151,27 @@ class Mesher:
         The same callable the main loop uses between its own tool calls. Held here as
         well because this desk holds the thread for minutes at a time, and a remark
         that waits that long is a remark that arrives after the thing it was about."""
-        self.provider = make_provider(cfg)
         self.model = cfg.mesher_model or cfg.model
+        self.provider = make_provider(cfg, model=self.model, default_headers=self.headers)
+        self._endpoint = endpoint_key(cfg, self.model)
+        """What `provider` was built for; see `_follow`."""
         self.effort = cfg.mesher_effort or "high"
         self.max_steps = int(cfg.mesher_max_steps or MAX_STEPS)
         self.max_seconds = float(cfg.mesher_max_seconds or MAX_SECONDS)
 
     # -- the run ---------------------------------------------------------------
 
+    def _follow(self) -> None:
+        """Pick up a mid-study `/model`: the model is read from the session's config at
+        every run, and the client rebuilt only when the provider, key or endpoint moved."""
+        self.model = self.cfg.mesher_model or self.cfg.model
+        endpoint = endpoint_key(self.cfg, self.model)
+        if endpoint != self._endpoint:
+            self._endpoint = endpoint
+            self.provider = make_provider(self.cfg, model=self.model, default_headers=self.headers)
+
     def run(self, request: str, case: str | None = None) -> MeshResult:
+        self._follow()
         case_rel = _case_name(case)
         case_dir = f"{self.home}/{case_rel}"
         started = time.monotonic()
@@ -148,6 +183,15 @@ class Mesher:
             result.error = f"could not make the case directory: {exc}"
             result.seconds = time.monotonic() - started
             return result
+
+        before = self._snapshot(case_dir)
+        """What was already in this case directory when the run started.
+
+        Only ever non-empty on a re-run -- an edit, a "make it 2 mm wider". It exists
+        so the finish check can answer the one question it could not previously ask:
+        did anything actually change? A desk that rebuilds the OLD geometry, verifies
+        the OLD geometry and reports success passes every other clause, because after a
+        no-op there is a perfectly valid mesh of the right rough size."""
 
         system = system_prompt(STEP_TIMEOUT_S)
         messages: list[dict[str, Any]] = [
@@ -203,7 +247,7 @@ class Mesher:
 
             if _is_finish(cmd):
                 result.summary = _summary(turn.text)
-                check = verify(self.backend, case_dir, case_rel, request)
+                check = verify(self.backend, case_dir, case_rel, request, before)
                 result.check = check
                 if check.ok:
                     result.ok = True
@@ -213,6 +257,8 @@ class Mesher:
 
             step = self._exec(cmd, case_dir, messages)
             result.steps.append(step)
+            if len(result.steps) == NUDGE_AT_STEP and not _has_mesh(result.steps):
+                _observe(messages, NUDGE)
             if self.on_step:
                 try:
                     self.on_step(step)
@@ -227,12 +273,51 @@ class Mesher:
             # mesh nobody looked at is exactly the failure this desk exists to end.
             # Measured, not assumed: a T10 run built 91,000 cells, hit a 400 on its
             # next model call, and was reported as "nothing was meshed".
-            result.check = verify(self.backend, case_dir, case_rel, request)
+            result.check = verify(self.backend, case_dir, case_rel, request, before)
             result.ok = result.check.ok
         if not result.summary:
             result.summary = _summary(last_text)
         result.png = self._render_bytes(result)
         return result
+
+    def _snapshot(self, case_dir: str) -> dict:
+        """The mesh already in the case directory, measured, or {} if there is none.
+
+        Whether a mesh is there is asked DIRECTLY, with a `stat` of the one file that
+        settles it, rather than smuggled into the shell as `test -f ... && ...`. Two
+        reasons, and the second is the one that matters: a shell guard makes the
+        "nothing was here" answer indistinguishable from "the look produced nothing",
+        and a backend that cannot answer at all then looks like a case with a mesh in
+        it. Asked directly, every failure -- missing file, unreachable workspace,
+        unreadable JSON -- falls to the same safe default of NO snapshot, which means
+        the no-op guard simply does not fire. A guard that cannot fire is the right
+        failure mode here; one that fires on bad information would refuse correct
+        first-time meshes.
+
+        `--no-check` skips checkMesh and draws no picture: all this needs is cell
+        count, bounds and patch areas.
+        """
+        try:
+            info = self.backend.stat(f"{case_dir}/constant/polyMesh/points")
+        except Exception:  # noqa: BLE001 - no mesh here is the common path
+            return {}
+        if getattr(info, "is_dir", False) or not getattr(info, "size", 0):
+            return {}
+        cmd = (f"python3 {LOOK} . --no-check --json {SNAPSHOT_REL} >/dev/null 2>&1; "
+               f"cat {SNAPSHOT_REL}")
+        try:
+            outcome = self.backend.exec(cmd, cwd=case_dir, timeout_s=120)
+        except Exception:  # noqa: BLE001 - no snapshot is not a reason not to mesh
+            return {}
+        text = outcome.output or ""
+        start, end = text.find("{"), text.rfind("}")
+        if start < 0 or end <= start:
+            return {}
+        try:
+            payload = json.loads(text[start:end + 1])
+        except ValueError:
+            return {}
+        return payload if isinstance(payload, dict) and payload.get("cells") else {}
 
     # -- the person ------------------------------------------------------------
 
@@ -301,7 +386,13 @@ class Mesher:
                       f"running detached as job {outcome.job_id}. Poll its log with "
                       "`tail`; do not start it again.")
         body = _clip(output, OUTPUT_CHARS)
-        head = f"exit {outcome.exit_code} ({seconds:.0f} s)"
+        if outcome.exit_code is None:
+            # A promoted command has no exit code here -- the job has it. `exit None`
+            # would be read as a number, and `exit 0` (what the backend used to say
+            # for this shape) as a mesh that was built.
+            head = f"no exit code yet: running as job {outcome.job_id} ({seconds:.0f} s)"
+        else:
+            head = f"exit {outcome.exit_code} ({seconds:.0f} s)"
         if outcome.truncated and outcome.log_path:
             head += f"; output cut, all of it is at {outcome.log_path}"
         blocks: list[dict[str, Any]] = [{"type": "text", "text": f"{head}\n{body}".rstrip()}]
@@ -429,6 +520,29 @@ def _is_empty(block: Any) -> bool:
         return False
     text = block.get("text") if isinstance(block, dict) else getattr(block, "text", "")
     return not (text or "").strip()
+
+
+NUDGE = (
+    f"That is {NUDGE_AT_STEP} commands and nothing has been meshed yet. Whatever is "
+    "left to work out about the shape, work it out in the mesh rather than before it: "
+    "build the coarsest version that exists at all, run the mesher, and look at it. "
+    "`/work/.toolbox/templates/` has a working 2D and 3D script that go from an "
+    "outline to a checked polyMesh, and a shape that is 80% right and on disk is worth "
+    "more than one that is exact and is not.")
+
+
+def _has_mesh(steps: list[Step]) -> bool:
+    """Whether any command so far has actually run a mesher.
+
+    Read off the commands rather than asked of the workspace: a `test -f` would be
+    another round trip on the very path this is trying to make cheaper, and a desk that
+    has not typed `gmsh`, `blockMesh`, `snappyHexMesh`, `cartesianMesh` or `gmshToFoam`
+    has certainly not meshed anything.
+    """
+    meshers = ("gmshtofoam", "blockmesh", "snappyhexmesh", "cartesianmesh",
+               "cartesian2dmesh", "gmsh.model.mesh", "gmsh -", "foamymesh")
+    joined = " ".join(step.cmd.lower() for step in steps)
+    return any(name in joined for name in meshers)
 
 
 def _observe(messages: list[dict[str, Any]], text: str) -> None:

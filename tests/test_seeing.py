@@ -74,12 +74,19 @@ def test_the_suffix_is_matched_whatever_its_case(ctx):
     assert isinstance(content, list)
 
 
-def test_an_explicit_byte_window_still_reads_bytes(ctx):
-    """Asking for an offset means asking for the file, not for a look at it."""
+def test_an_image_is_the_picture_whatever_window_is_asked_for(ctx):
+    """GPT fills in optional arguments, and its bytes are nothing a model can use: on
+    prod a `limit: 1000` read of a PNG came back as text full of NUL bytes, and a
+    48 KB window of a 250 KB render left the plot "not visually inspected"."""
     ctx.backend.files["/work/a.png"] = PNG
-    content, _ = dispatch(ctx, "read_file", {"path": "/work/a.png", "offset": 0, "limit": 8})
-    assert isinstance(content, str)
-    assert "bytes 0" in content
+    for args in ({}, {"offset": 0, "limit": 1_000_000}, {"offset": 0, "limit": len(PNG)},
+                 {"limit": 1_000_000}, {"offset": 0}, {"offset": 0, "limit": 8},
+                 {"limit": 1000}, {"offset": 1, "limit": 1_000_000},
+                 {"offset": 0, "limit": len(PNG) - 1}):
+        content, is_error = dispatch(ctx, "read_file", {"path": "/work/a.png", **args})
+        assert not is_error and isinstance(content, list), args
+        image = next(b for b in content if b["type"] == "image")
+        assert base64.b64decode(image["source"]["data"]) == PNG, args
 
 
 def test_an_oversized_image_reports_its_size_rather_than_vanishing(ctx):
@@ -158,11 +165,19 @@ class Paged(dict):
 
 
 def paging_backend(ctx, size=2_200_000, page=1_000_000):
-    ctx.backend.files["/work/big.png"] = b"\x89PNG\r\n\x1a\n" + b"\x00" * (size - 8)
+    # A real PNG tail, not just a header: since `images.incomplete` this file has to be
+    # a whole picture to be attached at all, and this test is about the PAGE SIZE rather
+    # than about validity. Filler with no IEND would now be refused for the right reason
+    # by the wrong test, which would hide the paging bug this exists to hold closed.
+    ctx.backend.files["/work/big.png"] = (
+        b"\x89PNG\r\n\x1a\n" + b"\x00" * (size - 16) + b"IEND\xaeB`\x82")
     original = ctx.backend.get_file
 
-    def get_file(path, offset=0, limit=None):
-        return original(path, offset=offset, limit=limit if limit is not None else page)
+    def get_file(path, offset=0, limit=None, **kwargs):
+        # `**kwargs` because a caller may bound its own read (`timeout`,
+        # `max_attempts`); what this stub is about is the page size, nothing else.
+        return original(path, offset=offset, limit=limit if limit is not None else page,
+                        **kwargs)
 
     ctx.backend.get_file = get_file
     return ctx
@@ -186,7 +201,7 @@ def test_a_short_read_is_refused_rather_than_attached(ctx):
     """If it still comes back short, saying so beats handing over a broken PNG."""
     ctx.backend.files["/work/short.png"] = b"\x89PNG\r\n\x1a\n" + b"\x00" * 500_000
 
-    def stingy(path, offset=0, limit=None):
+    def stingy(path, offset=0, limit=None, **kwargs):
         return ctx.backend.files[path][:1000]
 
     ctx.backend.get_file = stingy

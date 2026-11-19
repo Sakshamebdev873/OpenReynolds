@@ -149,28 +149,58 @@ def parse_log_tail(text: str) -> LogFacts:
 
 
 _DICT_ENTRY = re.compile(
-    r"^\s*(startTime|endTime|deltaT|writeInterval)\s+([0-9.eE+-]+)\s*;", re.M
+    r"^\s*(startTime|endTime|deltaT|writeInterval|purgeWrite)\s+([0-9.eE+-]+)\s*;", re.M
 )
 _STOP_AT = re.compile(r"^\s*stopAt\s+(\w+)\s*;", re.M)
+_START_FROM = re.compile(r"^\s*startFrom\s+(\w+)\s*;", re.M)
 _COMMENTS = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
 
 
+def _top_level(body: str) -> str:
+    """The dictionary with every nested `{ ... }` block blanked out.
+
+    A controlDict's own entries sit at brace depth zero; `FoamFile { ... }` and every
+    function object under `functions { ... }` sit deeper, and function objects carry
+    their OWN `writeInterval`. Read flat, the last one wins: a live case whose top
+    level said `writeInterval 0.02` and whose `forces` function object said
+    `writeInterval 5` was announced at launch as "writeInterval 5 (0 write times)",
+    which is a warning about a number that was never the run's. Blanking the nested
+    text rather than deleting it keeps `^` anchors and line structure intact."""
+    out = []
+    depth = 0
+    for ch in body:
+        if ch == "{":
+            depth += 1
+            out.append(" ")
+        elif ch == "}":
+            depth = max(0, depth - 1)
+            out.append(" ")
+        else:
+            out.append(ch if depth == 0 or ch == "\n" else " ")
+    return "".join(out)
+
+
 def parse_control_dict(text: str) -> dict[str, Any]:
-    """The run's bounds from `system/controlDict`.
+    """The run's bounds from `system/controlDict`, top-level entries only.
 
     `endTime` is only the end when `stopAt` says so -- `writeNow` and friends mean the
     run ends whenever somebody says, and a percentage against endTime would then be a
-    number about nothing."""
-    body = _COMMENTS.sub("", text)
+    number about nothing. `startFrom` (a word: startTime, firstTime, latestTime) and
+    `purgeWrite` (an integer; 0 keeps every write) are read for the launch note that
+    guards a transient run's data (`tools._restart_guard`)."""
+    body = _top_level(_COMMENTS.sub("", text))
     found: dict[str, Any] = {}
     for key, value in _DICT_ENTRY.findall(body):
         number = _float(value)
         if number is not None:
-            found[key] = number
+            found[key] = int(number) if key == "purgeWrite" else number
     stop = _STOP_AT.findall(body)
     if stop and stop[-1] != "endTime":
         found.pop("endTime", None)
         found["stopAt"] = stop[-1]
+    start_from = _START_FROM.findall(body)
+    if start_from:
+        found["startFrom"] = start_from[-1]
     return found
 
 
@@ -207,14 +237,84 @@ PHASE_OF = {
 _TOKEN = re.compile(r"[A-Za-z0-9_./-]+")
 
 
+_FELIX_SOLVE = re.compile(r"(?:^|[;&|(]\s*|\s)felix\s+(?:run|continue)\b")
+
+
+def is_felix_solve(cmd: str) -> bool:
+    """Whether a job's command is a Felix solve: `felix run` or `felix continue`."""
+    return bool(_FELIX_SOLVE.search(cmd or ""))
+
+
+def felix_job_progress(record: Any, tail: str, log_size: int) -> JobProgress | None:
+    """What the bar shows for a Felix solve, read from the tail of its log.
+
+    Felix's log has no `Time =` and its case has no controlDict, so the OpenFOAM
+    reading would show a solve as merely "running". `felix_progress` reads the
+    `step=` records (step, time, dt, residuals), the `ERROR:` / `WARNING:` lines and
+    the final status `felix run` prints; the tracker adds the case's `nsteps`."""
+    from . import felix_progress
+
+    felix = felix_progress.parse_felix_log(tail)
+    return JobProgress(
+        job_id=record.job_id,
+        name=record.name or record.job_id[:8],
+        phase="solving",
+        executable="felix",
+        facts=felix_progress.log_facts(felix),
+        log_size=log_size,
+        elapsed_s=_seconds_since(getattr(record, "launched_at", "")),
+        as_of=time.monotonic(),
+        step=felix.step,
+        felix=felix,
+    )
+
+
+FELIX_LOG_TAIL_BYTES = 256_000
+"""How much of a Felix job's log is read for its summary: the end, which is where the
+last `step=` records, the errors and the final status are."""
+
+
+def felix_job_summary(backend: Any, cmd: str, cwd: str, job_id: str,
+                      log_size: int | None) -> list[str] | None:
+    """A Felix solve's job in a few lines (`felix_progress.summary_lines`), for
+    `job_check` and the job-end wake; None for any other command.
+
+    The log is the job's own; the step it runs to is the case's (`last_step`), found
+    from the `felix run|continue <case>` in the command."""
+    from . import felix_progress
+
+    if not felix_progress.is_felix_cmd(cmd):
+        return None
+    size = log_size or 0
+    try:
+        text, _next, _eof = backend.job_tail(job_id, offset=max(0, size - FELIX_LOG_TAIL_BYTES))
+    except BackendError:
+        return None
+
+    def read(path: str) -> str | None:
+        try:
+            return backend.get_file(path, limit=32_000).decode("utf-8", "replace")
+        except (BackendError, OSError, KeyError):
+            return None
+
+    case_dir = felix_progress.case_dir_from_felix_cmd(cmd, cwd)
+    last_step = felix_progress.last_step(read, case_dir) if case_dir else None
+    return felix_progress.summary_lines(felix_progress.parse_felix_log(text), last_step)
+
+
 def phase_from_cmd(cmd: str) -> tuple[str, str]:
     """(phase, executable) for a shell command, from the last thing in it that this
     recognises. A chain like `blockMesh && simpleFoam` reads as solving: it is what
     the command is for, and the log says which part is actually running."""
     phase, exe = "running", ""
-    for token in _TOKEN.findall(cmd or ""):
+    tokens = _TOKEN.findall(cmd or "")
+    for i, token in enumerate(tokens):
         name = token.rsplit("/", 1)[-1]
-        if name in MESHERS:
+        if name == "felix" and i + 1 < len(tokens) and tokens[i + 1] in ("run", "continue"):
+            # A Felix solve (`felix run|continue <case>`) runs on a cloud GPU; this
+            # job is its client, and its log is the solve's.
+            phase, exe = "solving", "felix"
+        elif name in MESHERS:
             phase, exe = "meshing", name
         elif name in PHASE_OF:
             phase, exe = PHASE_OF[name], name
@@ -280,11 +380,25 @@ class JobProgress:
     log_size: int = 0
     as_of: float = 0.0
     """Monotonic clock at the last successful read."""
+    step: int | None = None
+    """A Felix job's last completed step; Felix counts steps, not an end time."""
+    end_step: int | None = None
+    """The step a Felix job runs to: control.yaml `nsteps` past the warm start's step
+    (`felix_progress.last_step`). A PTC run may stop before it."""
+    felix: Any = None
+    """The `felix_progress.FelixFacts` of a Felix job, for the wake line."""
 
     def headline(self, now: float | None = None) -> str:
         parts = [f"{self.phase} {self.name}".strip()]
         facts = self.facts
-        if self.phase == "solving" and facts.sim_time is not None:
+        if self.step is not None:
+            when = f"step {self.step}"
+            if self.end_step:
+                when += f" / {self.end_step}"
+            if facts.sim_time is not None:
+                when += f" · t {facts.sim_time:g}"
+            parts.append(when)
+        elif self.phase == "solving" and facts.sim_time is not None:
             when = f"Time {facts.sim_time:g}"
             if self.end_time is not None:
                 when += f" / {self.end_time:g} s"
@@ -381,13 +495,17 @@ class Tracker:
         self.store = store
         self.home = home
         self.local_dir = local_dir
-        self.concierge = None
-        """The front desk, told when the agent starts and stops working so it knows
-        whether the user is waiting on a busy agent. Set by the session; may be None."""
+        self._narrated = ""
+        """The last 'what's happening now' line said (`now_line`), so it is said again
+        only when it changes."""
         self._lock = threading.RLock()
         self._activity: Activity | None = None
         self._syncing_since: float | None = None
         self._sync_note = ""
+        self._workspace_since: float | None = None
+        """When the workspace was asked for, while it is still coming up; None once it
+        is here (or when it was here all along)."""
+        self._workspace_eta_s = 0.0
         self._jobs: dict[str, JobProgress] = {}
         self._first_seen: dict[str, tuple[float, float]] = {}
         self._jobs_refreshed = 0.0
@@ -408,19 +526,34 @@ class Tracker:
         with self._lock:
             self._activity = activity
             self._tool_polled = 0.0
-        if self.concierge is not None:
-            self.concierge.working(kind != "waiting")
         self.push()
 
     def idle(self) -> None:
         """The session thread finished whatever it was doing."""
         with self._lock:
             self._activity = None
-            jobs = bool(self._jobs)
-        if self.concierge is not None:
-            # A running job still keeps the desk narrating; a bare idle does not.
-            self.concierge.working(jobs)
         self.push()
+
+    # -- what the workspace says -----------------------------------------------
+
+    def workspace_starting(self, eta_s: float = 0.0) -> None:
+        """The session is running ahead of its workspace: the bar says so while
+        nothing else is happening, and a tool call that is waiting says what for.
+        `eta_s` is the hint the session was given, said as "usually about"."""
+        with self._lock:
+            self._workspace_since = time.monotonic()
+            self._workspace_eta_s = max(0.0, float(eta_s or 0.0))
+        self.push()
+
+    def workspace_ready(self) -> None:
+        with self._lock:
+            self._workspace_since = None
+        self.push()
+
+    @property
+    def workspace_pending(self) -> bool:
+        with self._lock:
+            return self._workspace_since is not None
 
     # -- what the mirror says --------------------------------------------------
 
@@ -478,6 +611,11 @@ class Tracker:
                 )
             except BackendError:
                 tail = ""
+        if is_felix_solve(record.cmd):
+            felix = felix_job_progress(record, tail, size)
+            if felix is not None:
+                self._felix_bounds(record, felix)
+                return felix
         facts = parse_log_tail(tail)
         phase, exe = phase_from_cmd(record.cmd)
         if facts.is_solver:
@@ -502,6 +640,56 @@ class Tracker:
             progress.stop_at = control.get("stopAt")
             self._estimate(progress)
         return progress
+
+    def _felix_bounds(self, record: Any, progress: JobProgress) -> None:
+        """A Felix job's step against the step its run ends at (`last_step`), and the
+        time left at the solver's own wall time per step -- labelled an estimate,
+        like the OpenFOAM one. Felix's case has no controlDict; its bound is a step
+        count."""
+        from . import felix_progress
+
+        felix = progress.felix
+        case_dir = felix_progress.case_dir_from_felix_cmd(
+            record.cmd, getattr(record, "cwd", "") or self.home)
+        if case_dir:
+            progress.end_step = self._felix_last_step(record.job_id, case_dir)
+        if progress.end_step and felix is not None and felix.step is not None \
+                and felix.step > progress.end_step:
+            # A step past the end means the case was misread (a warm start not
+            # named snapshot_<step>.vtu, YAML the line reader does not follow): say
+            # the step alone rather than a total it has already passed.
+            progress.end_step = None
+        if progress.end_step and felix is not None and felix.step is not None:
+            progress.fraction = max(0.0, min(1.0, felix.step / progress.end_step))
+            if felix.wall_step_mean and felix.step < progress.end_step \
+                    and felix.outcome == "running":
+                progress.eta_s = (progress.end_step - felix.step) * felix.wall_step_mean
+
+    def _felix_last_step(self, job_id: str, case_dir: str) -> int | None:
+        """`felix_progress.last_step` for a job's case, from the mirror when it is
+        here, else from the instance. Remembered per job, not per case: a case is
+        edited between its solves (`felix continue` rewrites `nsteps` and
+        `warm_start`), and one job's reading is not the next one's."""
+        from . import felix_progress
+
+        now = time.monotonic()
+        key = f"felix:{job_id}:{case_dir}"
+        cached = self._control.get(key)
+        if cached and now - cached[0] < CONTROL_DICT_TTL_S:
+            return cached[1]["last_step"]
+
+        def read(path: str) -> str | None:
+            text = self._read_local(path)
+            if text is None and self.backend is not None:
+                try:
+                    text = self.backend.get_file(path, limit=32_000).decode("utf-8", "replace")
+                except (BackendError, OSError):
+                    text = None
+            return text
+
+        last = felix_progress.last_step(read, case_dir)
+        self._control[key] = (now, {"last_step": last})
+        return last
 
     def _estimate(self, progress: JobProgress) -> None:
         """Fraction and time left, from what the log and the controlDict say.
@@ -559,9 +747,12 @@ class Tracker:
         """A `bash` command that said where its log goes can be watched while it runs."""
         with self._lock:
             activity = self._activity
+            workspace_pending = self._workspace_since is not None
         if activity is None or activity.kind != "tool" or not activity.log_path:
             return
-        if self.backend is None:
+        if self.backend is None or workspace_pending:
+            # A tool call made while the workspace is starting is waiting for it, and
+            # so would a read of its log be -- on this thread, which draws the bar.
             return
         now = time.monotonic()
         if now - self._tool_polled < TOOL_LOG_POLL_S:
@@ -594,6 +785,22 @@ class Tracker:
             syncing = self._syncing_since
             sync_note = self._sync_note
             tick = self._tick
+            workspace_since = self._workspace_since
+            workspace_eta = self._workspace_eta_s
+        if workspace_since is not None and not jobs:
+            # The workspace is still coming up. The model's own thinking and writing
+            # stay the headline -- that is the conversation this wait was moved out
+            # of the way of -- but a tool call is waiting, and says so, and with
+            # nothing else going on the bar says what everyone is waiting for.
+            waited = duration(now - workspace_since)
+            usually = f"usually about {workspace_eta:.0f} s" if workspace_eta > 0 else ""
+            if activity is not None and activity.kind == "tool":
+                return Progress(
+                    "starting", f"{activity.label} waiting for the workspace · {waited}",
+                    usually, None, True, tick,
+                )
+            if activity is None or activity.kind == "waiting":
+                return Progress("starting", f"workspace starting · {waited}", usually, None, True, tick)
         lead = next((j for j in jobs if j.fraction is not None), jobs[0] if jobs else None)
         if lead is not None:
             headline = lead.headline(now)
@@ -624,6 +831,55 @@ class Tracker:
             self.view.progress(self.snapshot())
         except Exception:  # noqa: BLE001 - presentation may not end a session
             pass
+        self._narrate()
+
+    def now_line(self) -> str:
+        """What the agent is doing right now, in a few words and with no clock in it:
+        the job that leads the bar, else what the session thread is in, else nothing.
+
+        The 'what's happening now' line. A model used to write it -- the front desk,
+        every couple of minutes, from a slice of the transcript -- and it read well and
+        cost a request each time, and said nothing the bar did not already know. This
+        is the bar's own knowledge in words. It has no elapsed time in it so that it
+        changes when the work does rather than every second; the bar carries the clock."""
+        with self._lock:
+            activity = self._activity
+            jobs = list(self._jobs.values())
+            starting = self._workspace_since is not None
+        lead = next((j for j in jobs if j.fraction is not None), jobs[0] if jobs else None)
+        if lead is not None:
+            line = f"{lead.phase} {lead.name}".strip()
+            if len(jobs) > 1:
+                line += f" (+{len(jobs) - 1} more)"
+            if activity is not None and activity.kind not in ("waiting", "tool"):
+                line += f"; the agent is {activity.kind} meanwhile"
+            return line
+        if activity is None or activity.kind == "waiting":
+            return "waiting for the workspace to start" if starting else ""
+        if activity.kind == "tool":
+            exe = phase_from_cmd(activity.cmd)[1] if activity.label == "bash" else ""
+            what = f"{activity.label}: {exe}" if exe else activity.label
+            if starting:
+                return f"{what}, waiting for the workspace to start"
+            return f"running {what}"
+        return activity.kind
+
+    def _narrate(self) -> None:
+        line = self.now_line()
+        with self._lock:
+            if line == self._narrated:
+                return
+            self._narrated = line
+        # An empty line is said too, once, when the last one stops being true: a view
+        # holds what it was told, and "waiting for the workspace to start" stayed on
+        # the web page after the start had failed (#48 on the web app).
+        narrate = getattr(self.view, "narration", None)
+        if narrate is None:
+            return
+        try:
+            narrate(line)
+        except Exception:  # noqa: BLE001 - presentation may not end a session
+            pass
 
     def facts_for_wake(self) -> list[str]:
         """Job facts in words, for the narration wake. Facts only: what the solver's
@@ -632,6 +888,11 @@ class Tracker:
         with self._lock:
             jobs = list(self._jobs.values())
         for job in jobs:
+            if job.felix is not None:
+                from .felix_progress import wake_line
+
+                lines.append(wake_line(job.name, job.felix, job.end_step))
+                continue
             facts = job.facts
             if facts.sim_time is None:
                 continue

@@ -8,8 +8,9 @@ import pytest
 from click.testing import CliRunner
 
 from conftest import FakeBackend, ScriptedReader, install_model, message, text_block, tool_block
+from shellprobe import Machine, Process
 from openreynolds import cli
-from openreynolds.backend.base import BackendError, ExecResult, JobStatus
+from openreynolds.backend.base import WORKSPACE_ROOT, BackendError, ExecResult, JobStatus
 from openreynolds.browse import Browser
 from openreynolds.config import Config
 from openreynolds.loop import Loop
@@ -245,6 +246,84 @@ def test_studies_lists_local_studies(tmp_path, monkeypatch):
     assert "1 job(s) running" in result.output
 
 
+def test_studies_can_answer_a_script_instead_of_a_person(tmp_path, monkeypatch):
+    """This and `doctor --json` are the two things something has to run before a first
+    session, and both answered only in rich markup -- so the id needed for `--study`
+    had to be recovered by parsing a styled line."""
+    root = tmp_path / "studies"
+    store = Store(root, "20260823-120000-abcd")
+    store.session.title = "elbow"
+    store.session.instance_id = "iid-1"
+    store.record_job("job-1", cmd="simpleFoam", name="solve")
+    monkeypatch.setattr(Config, "load", classmethod(lambda cls: Config(studies_dir=root)))
+
+    result = CliRunner().invoke(cli.main, ["studies", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["studies"][0]["study_id"] == "20260823-120000-abcd"
+    assert payload["studies"][0]["title"] == "elbow"
+    assert payload["studies"][0]["instance_id"] == "iid-1"
+    assert payload["studies"][0]["running_jobs"] == 1
+
+
+def test_the_group_output_flag_is_the_same_request_as_studies_own_json(
+    tmp_path, monkeypatch
+):
+    """`--output-format` is a GROUP option, so putting it in front of everything is
+    the obvious thing for an agent to do -- and `main()` returned before the mode was
+    applied whenever a subcommand was invoked. The flag was accepted, parsed and
+    discarded, and `openreynolds --output-format stream-json studies` exited 0 having
+    printed `20260912-162705-92f8  (untitled)  instance=local` and three more lines of
+    prose at a reader that cannot read prose."""
+    root = tmp_path / "studies"
+    Store(root, "20260823-120000-abcd").save()
+    monkeypatch.setattr(Config, "load", classmethod(lambda cls: Config(studies_dir=root)))
+
+    result = CliRunner().invoke(cli.main, ["--output-format", "stream-json", "studies"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["studies"][0]["study_id"] == "20260823-120000-abcd"
+
+
+def test_the_group_output_flag_is_the_same_request_as_doctors_own_json(monkeypatch):
+    monkeypatch.setattr(Config, "load", classmethod(lambda cls: Config()))
+    monkeypatch.setattr(cli, "run_checks", lambda cfg: [("config file", True, "")])
+
+    result = CliRunner().invoke(cli.main, ["--output-format", "stream-json", "doctor"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["ok"] is True
+
+
+def test_a_subcommand_with_no_json_answer_says_so_rather_than_printing_prose(
+    tmp_path, monkeypatch
+):
+    """The other half of not ignoring it. `renders` has no structured answer, and an
+    agent that got four lines of rich markup on stdout with exit 0 had no hint that
+    the flag did nothing."""
+    monkeypatch.setattr(
+        Config, "load", classmethod(lambda cls: Config(studies_dir=tmp_path / "s"))
+    )
+
+    result = CliRunner().invoke(cli.main, ["--output-format", "stream-json", "renders"])
+
+    assert result.exit_code == 2, result.output
+    assert "--output-format" in result.output
+    assert "studies" in result.output and "doctor" in result.output
+
+
+def test_studies_json_with_none_is_still_an_object(tmp_path, monkeypatch):
+    """"No studies under ..." is a sentence, and a script reading it as a study list
+    is a script that has already gone wrong."""
+    monkeypatch.setattr(
+        Config, "load", classmethod(lambda cls: Config(studies_dir=tmp_path / "none"))
+    )
+    result = CliRunner().invoke(cli.main, ["studies", "--json"])
+    assert json.loads(result.output)["studies"] == []
+
+
 def test_studies_with_none(tmp_path, monkeypatch):
     monkeypatch.setattr(
         Config, "load", classmethod(lambda cls: Config(studies_dir=tmp_path / "none"))
@@ -425,6 +504,7 @@ def test_doctor_reports_every_check(monkeypatch):
         "workspace service",
         "model API",
         "capture",
+        "sharing",
         "toolbox",
         "terminal",
         "video assembly",
@@ -495,6 +575,34 @@ def test_doctor_flags_missing_settings(monkeypatch):
     settings = results[0]
     assert settings[1] is False
     assert "FOAMD_API_KEY" in settings[0]
+
+
+def test_doctor_can_answer_a_script_and_keeps_its_exit_code(monkeypatch):
+    """The verdict was seven lines of prose plus an exit code. `run_checks` already
+    answers in tuples; the prose was the only thing between a script and the answer.
+    The exit code is unchanged, so a caller that reads only that keeps working."""
+    monkeypatch.setattr(Config, "load", classmethod(lambda cls: full_config()))
+    stub_service(monkeypatch, instances=[{"id": "abcdefgh1234", "status": "running"}])
+    stub_model(monkeypatch)
+
+    result = CliRunner().invoke(cli.main, ["doctor", "--json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["ok"] is True and payload["failed"] == []
+    assert {row["check"] for row in payload["checks"]} >= {"settings", "model API"}
+
+
+def test_doctor_json_still_fails_when_a_check_fails(monkeypatch):
+    monkeypatch.setattr(Config, "load", classmethod(lambda cls: Config()))
+    stub_service(monkeypatch)
+    stub_model(monkeypatch)
+
+    result = CliRunner().invoke(cli.main, ["doctor", "--json"])
+
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["ok"] is False and payload["failed"]
 
 
 def test_doctor_exits_nonzero_when_something_is_wrong(monkeypatch):
@@ -885,6 +993,26 @@ def test_ending_a_session_stops_the_jobs_and_the_instance(store, quiet_console):
     assert not store.live_jobs(), "and the work was stopped first"
 
 
+def test_a_job_the_end_could_not_signal_is_recorded_as_stopped_with_the_instance(
+    store, quiet_console
+):
+    """A job still starting answers its kill `409 kill_not_delivered`; the instance went
+    down anyway and the record said running, then the service's `sandbox_expired`."""
+    backend = Stoppable()
+    store.record_job("job-1", cmd="simpleFoam", name="solve")
+    backend.jobs["job-1"] = JobStatus(job_id="job-1", status="running", name="solve")
+
+    def not_delivered(job_id, signal="TERM"):
+        raise BackendError("no process group to signal", code="kill_not_delivered")
+
+    backend.job_kill = not_delivered
+    cli._close_down(backend, store)
+
+    assert backend.stopped == 1
+    record = store.session.jobs["job-1"]
+    assert (record.status, record.end_reason) == ("killed", "killed_by_client")
+
+
 def test_keep_alive_leaves_it_up_and_says_what_it_is_choosing(store, quiet_console, capsys):
     backend = Stoppable()
     store.record_job("job-1", cmd="simpleFoam", name="solve")
@@ -894,6 +1022,138 @@ def test_keep_alive_leaves_it_up_and_says_what_it_is_choosing(store, quiet_conso
 
     assert backend.stopped == 0
     assert store.live_jobs(), "the job is still going, which is the point of the flag"
+
+
+class Checkpointing(Stoppable):
+    """A hosted-shaped backend that also copies to durable storage on request."""
+
+    def __init__(self, answer=None, error=None, order=None, **kwargs):
+        super().__init__(**kwargs)
+        self.answer = answer if answer is not None else {"id": "i", "status": "running", "checkpoint": {
+            "files": 9, "manifest_key": "ws/manifest.json", "taken_at": "2026-10-21T10:00:00Z"}}
+        self.error = error
+        self.asked: list[tuple[list[str], float]] = []
+        self.order = order if order is not None else []
+
+    def checkpoint(self, paths, timeout_s=90.0):
+        self.order.append("checkpoint")
+        self.asked.append((paths, timeout_s))
+        if self.error is not None:
+            raise self.error
+        return self.answer
+
+    def shutdown(self):
+        self.order.append("shutdown")
+        super().shutdown()
+
+
+def _recorded(store):
+    import json as _json
+    return _json.loads((store.dir / "session.json").read_text())["checkpoint"]
+
+
+def test_a_hosted_end_copies_the_study_to_durable_storage_and_records_when(store, quiet_console):
+    """#51: at a session cap above one End leaves the workspace up for the reaper, and
+    nothing else copied the report written in the last turn until the reaper's stop.
+    So End asks for the study's own directory to be copied first, waits for it, and
+    the record says which copy it was."""
+    backend = Checkpointing()
+    cli._close_down(backend, _with_a_home(store), keep_alive=True)
+    assert backend.asked == [([f"{WORKSPACE_ROOT}/study-test"], cli.END_CHECKPOINT_TIMEOUT_S)]
+    assert backend.stopped == 0
+    record = _recorded(store)
+    assert record["taken_at"] == "2026-10-21T10:00:00Z" and record["manifest_key"] == "ws/manifest.json"
+    assert record["files"] == 9 and record["asked_at"] and "error" not in record
+
+
+def test_an_end_that_leaves_the_workspace_up_for_a_running_job_copies_the_study(store, quiet_console, monkeypatch):
+    backend = Checkpointing()
+    monkeypatch.setattr(cli, "_still_running_on_the_instance", lambda b, s: [{"id": "j9", "name": "other"}])
+    cli._close_down(backend, _with_a_home(store))
+    assert backend.stopped == 0 and len(backend.asked) == 1
+
+
+def test_an_end_that_puts_the_workspace_down_leaves_the_copy_to_the_stop(store, quiet_console):
+    """The stop copies the whole workspace before the instance goes, so a scoped copy
+    first would only queue behind the full pass the daemon starts when the stopped
+    jobs end."""
+    order: list[str] = []
+    backend = Checkpointing(order=order)
+    store.record_job("job-1", cmd="simpleFoam", name="solve")
+    backend.jobs["job-1"] = JobStatus(job_id="job-1", status="running", name="solve")
+    cli._close_down(backend, _with_a_home(store))
+    assert not store.live_jobs() and order == ["shutdown"]
+
+
+def test_a_stop_that_fails_still_gets_the_study_copied(store, quiet_console):
+    order: list[str] = []
+
+    class Unstoppable(Checkpointing):
+        def shutdown(self):
+            raise BackendError("service unavailable", code="unavailable", status=503)
+
+    backend = Unstoppable(order=order)
+    cli._close_down(backend, _with_a_home(store))
+    assert order == ["checkpoint"] and _recorded(store)["taken_at"]
+
+
+def test_a_service_that_cannot_copy_on_request_is_recorded_quietly(store, monkeypatch):
+    import io as _io
+
+    from rich.console import Console
+
+    for status in (404, 501):
+        said = _io.StringIO()
+        monkeypatch.setattr(cli, "console", Console(file=said, force_terminal=False, width=200))
+        backend = Checkpointing(error=BackendError("Not Found", code="http_error", status=status))
+        cli._close_down(backend, _with_a_home(store), keep_alive=True)
+        assert _recorded(store) == {"asked_at": _recorded(store)["asked_at"], "unsupported": True}
+        assert "could not confirm" not in said.getvalue()
+
+
+def test_the_pending_stand_in_forwards_the_copy_once_the_workspace_is_here():
+    from openreynolds.backend.pending import PendingBackend
+
+    pending = PendingBackend.__new__(PendingBackend)
+    pending._live = None
+    assert pending.checkpoint(["/work/s"]) is None, "no workspace yet, nothing to ask"
+    pending._live = Checkpointing()
+    assert pending.checkpoint(["/work/s"], timeout_s=45)["checkpoint"]["taken_at"]
+    assert pending._live.asked == [(["/work/s"], 45)]
+    pending._live = Stoppable()
+    assert pending.checkpoint(["/work/s"]) is None, "a local workspace keeps no copy to bring up to date"
+
+
+def test_a_copy_that_could_not_be_made_is_said_and_recorded_not_assumed(store, monkeypatch):
+    import io as _io
+
+    from rich.console import Console
+
+    said = _io.StringIO()
+    monkeypatch.setattr(cli, "console", Console(file=said, force_terminal=False, width=200))
+    backend = Checkpointing(error=BackendError("the workspace could not be copied: S3 AccessDenied",
+                                               code="checkpoint_failed", status=502))
+    cli._close_down(backend, _with_a_home(store), keep_alive=True)
+    assert "could not confirm this study's files reached durable storage" in said.getvalue()
+    assert "AccessDenied" in said.getvalue()
+    assert "AccessDenied" in _recorded(store)["error"] and "taken_at" not in _recorded(store)
+
+
+def test_an_answer_with_no_copy_in_it_is_not_taken_for_one(store, quiet_console):
+    backend = Checkpointing(answer={"id": "i", "status": "running", "checkpoint": {}})
+    cli._close_down(backend, _with_a_home(store), keep_alive=True)
+    assert "without a checkpoint" in _recorded(store)["error"]
+
+
+def test_a_workspace_already_stopped_is_recorded_as_such(store, quiet_console):
+    backend = Checkpointing(answer={"id": "i", "status": "stopped", "checkpoint": None})
+    cli._close_down(backend, _with_a_home(store), keep_alive=True)
+    assert _recorded(store)["stopped"] is True
+
+
+def test_a_local_workspace_is_not_asked_to_copy_itself(store, quiet_console):
+    cli._close_down(Stoppable(), _with_a_home(store), keep_alive=True)
+    assert _recorded(store) is None
 
 
 def test_a_borrowed_instance_is_handed_back(quiet_console):
@@ -911,12 +1171,12 @@ def test_an_instance_somebody_else_started_is_left_alone(quiet_console):
     assert backend.stopped == 0
 
 
-def test_a_session_does_not_stop_a_workspace_it_merely_joined(store, monkeypatch):
-    """The session path never asked the question `_release` has always asked.
-
-    An account is capped at one instance and `acquire()` joins the existing one, so an
-    ordinary `/exit` in a second terminal stopped the container out from under the first
-    one's solve. `_release` forty lines away already had the rule."""
+def test_a_joined_study_with_no_directory_of_its_own_leaves_the_workspace_up(
+        store, monkeypatch):
+    """A study that predates homes lives at /work, which is every study's directory at
+    once, so the neighbour probe cannot tell its own work from anyone else's. Joined,
+    it cannot rule another session out, and leaves the workspace to whoever started it.
+    `_release` forty lines away has the same rule for read-only commands."""
     import io as _io
 
     from rich.console import Console
@@ -926,12 +1186,422 @@ def test_a_session_does_not_stop_a_workspace_it_merely_joined(store, monkeypatch
     backend = Stoppable(already_running=True)
     cli._close_down(backend, store)
 
-    assert backend.stopped == 0, "it belongs to whoever started it"
+    assert backend.stopped == 0, "it cannot tell whether somebody else is using it"
     assert "left up" in said.getvalue(), "and the person is told why it is still running"
 
 
 def test_a_session_that_started_the_workspace_still_puts_it_down(store, quiet_console):
     backend = Stoppable(already_running=False)
+    cli._close_down(backend, store)
+    assert backend.stopped == 1
+
+
+# -- F-46: the shutdown half asks what is running, not who started it ----------
+
+
+class Busy(Stoppable):
+    """A backend whose service reports jobs still running on the workspace."""
+
+    def __init__(self, rows=(), fail=None, **kw):
+        super().__init__(**kw)
+        self.rows = list(rows)
+        self.fail = fail
+
+    def active_jobs(self):
+        if self.fail is not None:
+            raise self.fail
+        return list(self.rows)
+
+
+def _said(monkeypatch):
+    import io as _io
+
+    from rich.console import Console
+
+    out = _io.StringIO()
+    monkeypatch.setattr(cli, "console", Console(file=out, force_terminal=False, width=100))
+    return out
+
+
+def test_a_detached_job_nobody_in_this_session_started_keeps_the_workspace_up(
+        store, monkeypatch):
+    """F-46. Jobs outlive sessions by design -- the system prompt says so -- but a
+    job started outside any session leaves no flag anywhere, so the next session to
+    start the instance also owned it and stopped it on the way out. A detached
+    rendering job died that way with six of its eight steps done."""
+    out = _said(monkeypatch)
+    backend = Busy(rows=[{"id": "job-9", "name": "render", "status": "running"}])
+
+    cli._close_down(backend, store)
+
+    assert backend.stopped == 0, "something else is still running on it"
+    said = out.getvalue()
+    assert "render" in said, "and the person is told what"
+    assert "openreynolds stop" in said, "and how to end it themselves"
+
+
+def test_this_sessions_own_jobs_do_not_keep_the_workspace_up(store, quiet_console):
+    """They have just been stopped, two lines above. Counting them would mean a
+    session that ran a single solve could never put its own instance down."""
+    store.record_job("job-1", cmd="simpleFoam", name="solve")
+    backend = Busy(rows=[{"id": "job-1", "name": "solve", "status": "running"}])
+    backend.jobs["job-1"] = JobStatus(job_id="job-1", status="running", name="solve")
+
+    cli._close_down(backend, store)
+
+    assert backend.stopped == 1
+
+
+def test_an_idle_workspace_is_still_put_down(store, quiet_console):
+    backend = Busy(rows=[])
+    cli._close_down(backend, store)
+    assert backend.stopped == 1
+
+
+# -- the shutdown half sees work that never became a job row -------------------
+
+
+class Neighboured(Busy):
+    """A workspace with somebody else's process working in another study's directory.
+
+    The mesh desk does all of its work through `backend.exec`, one bash block at a
+    time -- so there is nothing in the jobs table to find, which is the whole point.
+    """
+
+    def __init__(self, processes=(), **kw):
+        super().__init__(**kw)
+        self.processes = list(processes)
+        self.probes = 0
+
+    def exec(self, cmd, cwd=None, timeout_s=120, *, background=False):
+        if "/proc/" in cmd and WORKSPACE_ROOT in cmd:
+            self.probes += 1
+            if "continue ;;" in cmd:  # the neighbour probe, not the own-solver one
+                return ExecResult(0, "".join(f"{p}\n" for p in self.processes), False, None)
+        return super().exec(cmd, cwd=cwd, timeout_s=timeout_s, background=background)
+
+
+def _with_a_home(store):
+    store.session.home = f"{WORKSPACE_ROOT}/study-test"
+    store.save()
+    return store
+
+
+def test_a_neighbours_running_mesh_keeps_the_workspace_up(store, monkeypatch):
+    """The live half of F-26's residue. `_still_running_on_the_instance` reads JOB
+    ROWS, and the mesh desk runs every step as an exec capped around four minutes --
+    so a session that started the instance itself and saw no running job rows called
+    shutdown(), the service terminated the Sandbox, and a neighbouring session's
+    snappyHexMesh died mid-step with a bare 500 on the other side and nothing said on
+    this one."""
+    out = _said(monkeypatch)
+    backend = Neighboured(rows=[], processes=["4021 snappyHexMesh"])
+
+    cli._close_down(backend, _with_a_home(store))
+
+    assert backend.probes, "it asked what else is working on the volume"
+    assert backend.stopped == 0, "somebody else's mesh was still running"
+    said = out.getvalue()
+    assert "snappyHexMesh" in said, "and the person is told what stopped it"
+    assert "left up" in said
+
+
+def test_the_probe_does_not_count_its_own_shell_as_somebody_working(store, quiet_console):
+    """It runs in a bash block and spawns `cat` and `readlink` once per process, so
+    without a filter it reports itself and no session ever puts an instance down."""
+    backend = Neighboured(rows=[], processes=["12 bash", "13 cat", "14 readlink", "15 ps"])
+
+    cli._close_down(backend, _with_a_home(store))
+
+    assert backend.stopped == 1
+
+
+def test_a_study_with_no_directory_of_its_own_does_not_guess(store, quiet_console):
+    """A home of /work is every study's directory at once, so it distinguishes
+    nothing. Studies that predate homes fall back to it, and the older questions --
+    who started this, what job rows are live -- still decide there."""
+    backend = Neighboured(rows=[], processes=["4021 simpleFoam"])
+
+    cli._close_down(backend, store)
+
+    assert backend.probes == 0, "there was nothing to compare against"
+    assert backend.stopped == 1
+
+
+class Refusing(Neighboured):
+    """A workspace whose exec route refuses. `fails` is how many attempts refuse
+    before the rest are answered."""
+
+    def __init__(self, exc, fails=99, **kw):
+        super().__init__(**kw)
+        self.exc, self.fails = exc, fails
+
+    def exec(self, cmd, cwd=None, timeout_s=120, *, background=False):
+        if "/proc/" in cmd and "continue ;;" in cmd:
+            self.probes += 1
+            if self.probes <= self.fails:
+                raise self.exc
+            return ExecResult(0, "".join(f"{p}\n" for p in self.processes), False, None)
+        return Busy.exec(self, cmd, cwd=cwd, timeout_s=timeout_s, background=background)
+
+
+@pytest.fixture
+def no_probe_pause(monkeypatch):
+    monkeypatch.setattr(cli, "PROBE_RETRY_PAUSE_S", 0.0)
+
+
+def test_a_probe_that_cannot_be_run_leaves_the_workspace_up(
+    store, monkeypatch, no_probe_pause
+):
+    """A question that could not be put is not the answer "nobody is here", and this
+    read it as one: every BackendError became [], and [] means terminate.
+
+    The states that make the probe fail are exactly the states where a neighbour is
+    most likely. `quota.ensure_room` now runs on the exec route, so once /work is at
+    its quota every synchronous exec -- this probe included -- is refused with 507
+    BEFORE it runs; 507 is not retried by the client, so it arrives as a BackendError
+    on the first answer. A session ending at that moment terminated the container its
+    neighbour was meshing in. The costs are asymmetric the wrong way round for a
+    guess: leaving the workspace up costs at most the reaper's idle window, and
+    terminating it under a neighbour destroys an in-flight mesh or solve."""
+    out = _said(monkeypatch)
+    backend = Refusing(BackendError("volume full", code="volume_full", status=507), rows=[])
+
+    cli._close_down(backend, _with_a_home(store))
+
+    assert backend.stopped == 0, "the question could not be put, so nothing was assumed"
+    assert backend.probes == 2, "and it was asked twice before being given up on"
+    said = out.getvalue()
+    assert "could not check" in said
+    assert "left up" in said, "and the person is told the workspace is still there"
+    assert "openreynolds stop" in said, "and how to put it down themselves"
+
+
+def test_a_probe_that_fails_once_is_asked_again_rather_than_given_up_on(
+    store, monkeypatch, no_probe_pause
+):
+    """A 503 from a control plane mid-deploy is usually gone two seconds later, and
+    the answer it then gives is a real one -- better than the refusal above, which
+    leaves a container up that nobody may be using."""
+    out = _said(monkeypatch)
+    backend = Refusing(
+        BackendError("gateway down", code="unavailable", status=503),
+        fails=1,
+        rows=[],
+        processes=["4021 snappyHexMesh"],
+    )
+
+    cli._close_down(backend, _with_a_home(store))
+
+    assert backend.probes == 2
+    assert backend.stopped == 0
+    assert "snappyHexMesh" in out.getvalue()
+
+
+def test_a_probe_that_answers_on_the_retry_can_still_put_an_idle_workspace_down(
+    store, quiet_console, no_probe_pause
+):
+    """The retry is not a licence to leave every workspace up: an answer is an
+    answer, and an empty one still means nobody is here."""
+    backend = Refusing(
+        BackendError("gateway down", code="unavailable", status=503), fails=1, rows=[]
+    )
+
+    cli._close_down(backend, _with_a_home(store))
+
+    assert backend.probes == 2
+    assert backend.stopped == 1
+
+
+def test_a_workspace_someone_else_is_working_on_is_shared_whoever_started_it(
+    store, monkeypatch
+):
+    """Who STARTED the container is the wrong question and always was. Two sessions
+    listing while the instance row still reads `stopped` both conclude they started
+    it, and the first to exit stops it from under the other."""
+    out = _said(monkeypatch)
+    backend = Neighboured(rows=[], processes=["4021 checkMesh"], already_running=False)
+
+    cli._close_down(backend, _with_a_home(store))
+
+    assert backend.stopped == 0
+    assert "another session is working on this workspace" in out.getvalue()
+
+
+def test_joining_a_workspace_nobody_is_working_on_still_puts_it_down(store, monkeypatch):
+    """Joining used to decide the close-down on its own: a joined session always left
+    the workspace up. So the next `openreynolds` found it running, joined it, and left
+    it up again -- one person relaunching the CLI kept an idle container alive launch
+    after launch, each screen saying "joining the workspace already running" and no
+    session anywhere on the web to explain it (instance 35c9f018, 2026-09-17)."""
+    out = _said(monkeypatch)
+    backend = Neighboured(rows=[], processes=[], already_running=True)
+
+    cli._close_down(backend, _with_a_home(store))
+
+    assert backend.probes, "joining is a reason to ask, not a reason to skip asking"
+    assert backend.stopped == 1, "nobody was working on it"
+    assert "joined a running workspace" in out.getvalue()
+
+
+def test_joining_a_workspace_a_neighbour_is_meshing_in_leaves_it_up(store, monkeypatch):
+    out = _said(monkeypatch)
+    backend = Neighboured(rows=[], processes=["4021 snappyHexMesh"], already_running=True)
+
+    cli._close_down(backend, _with_a_home(store))
+
+    assert backend.stopped == 0
+    assert "snappyHexMesh" in out.getvalue()
+
+
+def test_joining_a_workspace_with_a_detached_job_on_it_leaves_it_up(store, monkeypatch):
+    out = _said(monkeypatch)
+    backend = Neighboured(
+        rows=[{"id": "job-9", "name": "render", "status": "running"}],
+        already_running=True,
+    )
+
+    cli._close_down(backend, _with_a_home(store))
+
+    assert backend.stopped == 0
+    assert "render" in out.getvalue()
+
+
+def test_a_joined_session_whose_probe_cannot_run_leaves_the_workspace_up(
+    store, monkeypatch, no_probe_pause
+):
+    out = _said(monkeypatch)
+    backend = Refusing(
+        BackendError("volume full", code="volume_full", status=507),
+        rows=[],
+        already_running=True,
+    )
+
+    cli._close_down(backend, _with_a_home(store))
+
+    assert backend.stopped == 0
+    assert "could not tell" in out.getvalue()
+
+
+def test_a_listing_that_fails_does_not_keep_the_workspace_up(store, monkeypatch):
+    """The asymmetry is deliberate. A workspace left up on an unanswerable question
+    bills until a reaper notices; the shutdown is the safe default, and the failure
+    is said out loud rather than turned into a refusal to exit."""
+    out = _said(monkeypatch)
+    backend = Busy(fail=BackendError("gateway down", code="unavailable", status=503))
+
+    cli._close_down(backend, store)
+
+    assert backend.stopped == 1
+    assert "could not check" in out.getvalue()
+
+
+# -- the probe against a container shaped the way a real one is ----------------
+#
+# Everything above answers the probe with canned rows, which is why a probe that
+# matched nothing in production for its whole life passed every test it had. The
+# fakes below RUN the script (tests/shellprobe.py), against a container where `/work`
+# is a symlink to the Volume -- which is what a Modal Sandbox is.
+
+VOLUME = "/__modal/volumes/vo-QLeP1IjwPg9DkyX8ENl2HW"
+"""The physical path behind `/work`, from the production transcript that prints the
+same case both ways: `Case : /__modal/volumes/vo-QLeP1IjwPg9DkyX8ENl2HW/onera_hisa`
+from getcwd and `Case : /work/onera_hisa` from `$PWD`."""
+
+
+class Sandboxed(Busy):
+    """A workspace that evaluates the probe instead of answering it from a script.
+
+    `/work` is not a directory inside a Modal Sandbox: it is a symlink to
+    `/__modal/volumes/vo-<id>`, and `/proc/<pid>/cwd` is a kernel magic link that
+    answers with the physical path however the process got there.
+    """
+
+    def __init__(self, *processes, **kw):
+        super().__init__(**kw)
+        self.machine = Machine(
+            links={WORKSPACE_ROOT: VOLUME},
+            processes=[Process(pid, comm, cwd) for pid, comm, cwd in processes],
+            cwd=WORKSPACE_ROOT,
+        )
+        self.probes = 0
+
+    def exec(self, cmd, cwd=None, timeout_s=120, *, background=False):
+        if "/proc/" in cmd:
+            self.probes += 1
+            return ExecResult(0, self.machine.run(cmd), False, None)
+        return super().exec(cmd, cwd=cwd, timeout_s=timeout_s, background=background)
+
+
+def test_a_neighbours_mesh_is_found_when_work_is_a_symlink_to_the_volume(
+    store, monkeypatch
+):
+    """The probe compared `readlink /proc/<pid>/cwd` against the LITERAL `/work`, and
+    inside a Modal Sandbox nothing is ever spelled that way: foamd's own quota check
+    measured `du -sm /work` at 1 MB against `du -sLm /work` at 28633 MB on the same
+    live Sandbox, and its jail check resolves the root with `realpath -m` rather than
+    comparing the string. So the match arm never fired, `_neighbour_work` always
+    answered [], and `shared` collapsed to exactly the pre-fix behaviour this guard
+    was written to replace -- while a neighbour's snappyHexMesh died mid-step."""
+    out = _said(monkeypatch)
+    backend = Sandboxed(("4021", "snappyHexMesh", f"{VOLUME}/other/case"), rows=[])
+
+    cli._close_down(backend, _with_a_home(store))
+
+    assert backend.probes, "it asked"
+    assert backend.stopped == 0, "and somebody else's mesh was still running"
+    assert "snappyHexMesh" in out.getvalue()
+
+
+def test_this_studys_own_solver_is_not_mistaken_for_a_neighbour_through_the_symlink(
+    store, quiet_console
+):
+    """The other half of resolving the roots: our own work is under the same physical
+    prefix, so a probe that resolved only the volume root and not the home would call
+    every session its own neighbour and no instance would ever be put down."""
+    backend = Sandboxed(("4023", "simpleFoam", f"{VOLUME}/study-test/case"), rows=[])
+
+    cli._close_down(backend, _with_a_home(store))
+
+    assert backend.stopped == 1
+
+
+def test_a_neighbour_copying_a_mesh_is_work_and_not_housekeeping(store, monkeypatch):
+    """`cp`, `mv`, `rm`, `tar`, `gzip` and `find` were all filtered as housekeeping.
+    On this image they are the data-moving half of a real pipeline: a mesh step is one
+    exec block, `cd /work/<B>/case && cp -r ../mesh/constant/polyMesh constant/ &&
+    snappyHexMesh -overwrite`, and during the `cp` -- minutes for a multi-GB mesh over
+    the 9p Volume -- the block's only process was quiet. The exiting session
+    terminated the container mid-copy, and because `/stop` keeps the Volume the
+    half-copied `constant/polyMesh` stayed behind as a corrupt mesh for the next
+    session to inherit."""
+    out = _said(monkeypatch)
+    backend = Sandboxed(("4022", "cp", f"{VOLUME}/other/case"), rows=[])
+
+    cli._close_down(backend, _with_a_home(store))
+
+    assert backend.stopped == 0
+    assert "cp" in out.getvalue()
+
+
+def test_the_probe_steps_outside_the_workspace_so_it_cannot_report_itself(store):
+    """It runs in a shell the exec route drops in the workspace root and spawns `cat`
+    and `readlink` once per process it looks at. Hiding those by NAME is what made
+    `cp` and `rm` invisible; stepping out of the workspace first hides them by
+    working directory instead, and hides nothing else."""
+    machine = Machine(links={WORKSPACE_ROOT: VOLUME}, cwd=WORKSPACE_ROOT)
+
+    output = machine.run(
+        cli._NEIGHBOUR_PROBE % (f"'{WORKSPACE_ROOT}/study-test'", f"'{WORKSPACE_ROOT}'")
+    )
+
+    assert output == "", f"the probe reported itself: {output!r}"
+
+
+def test_a_backend_with_no_such_question_is_unaffected(store, quiet_console):
+    """The local backend has no shared lifecycle and answers nothing."""
+    backend = Stoppable()
+    assert not hasattr(backend, "active_jobs") or backend.active_jobs() == []
     cli._close_down(backend, store)
     assert backend.stopped == 1
 
@@ -1042,56 +1712,100 @@ def test_the_interactive_loop_tells_the_bar_when_it_is_waiting(
     assert bar.kinds[0] == "waiting"
 
 
-# -- the front desk ------------------------------------------------------------
+# -- no front desk: plain messages are the agent's, side questions are apart ------
 
 
-class FakeDesk:
+class FakeSide:
+    """Stands in for `desk.SideChat`."""
+
     def __init__(self):
         self.asked = []
-        self.working_states = []
 
-    def ask(self, text):
+    def ask(self, text, wait=False):
         self.asked.append(text)
 
-    def working(self, yes=True):
-        self.working_states.append(yes)
 
-
-def test_a_message_typed_mid_turn_goes_to_both_the_model_and_the_desk(
+def test_a_message_typed_mid_turn_goes_to_the_model_and_nothing_answers_for_it(
     loop, backend, store, view
 ):
-    """The screenshot bug: mid-turn text reached the model (eventually) but nothing
-    answered now. It must now also reach the desk."""
-    desk = FakeDesk()
+    """The front desk used to answer it with a cheaper model as well. Now it is the
+    agent's alone; the screen says at once that it is queued."""
+    side = FakeSide()
     reader = ScriptedReader(["how long will this take?"])
 
-    handed = cli._typed_while_working(loop, view, Browser(backend, store), store, reader, concierge=desk)
+    handed = cli._typed_while_working(loop, view, Browser(backend, store), store, reader, side=side)
 
-    assert handed == "how long will this take?"  # still goes to the model
-    assert desk.asked == ["how long will this take?"]  # and to the desk, now
-
-
-def test_a_local_command_mid_turn_does_not_reach_the_desk(loop, backend, store, view):
-    desk = FakeDesk()
-    reader = ScriptedReader(["/status"])
-
-    cli._typed_while_working(loop, view, Browser(backend, store), store, reader, concierge=desk)
-
-    assert desk.asked == []  # /status is answered locally; the desk is for questions
+    assert handed == "how long will this take?"
+    assert side.asked == [] and view.desk_replies == []
+    assert view.receipts and view.receipts[0].startswith("queued")
 
 
-def test_typing_during_a_job_reaches_the_desk_too(loop, backend, store, view, quiet_console):
+def test_a_local_command_mid_turn_reaches_neither(loop, backend, store, view):
+    side = FakeSide()
+    cli._typed_while_working(loop, view, Browser(backend, store), store,
+                             ScriptedReader(["/status"]), side=side)
+    assert side.asked == [] and view.receipts == []
+
+
+def test_a_side_question_during_a_job_goes_to_the_side_chat_not_the_model(
+    loop, backend, store, view, quiet_console
+):
     backend.job_start("sleep 600", name="solve")
     store.record_job("job-1", cmd="sleep 600", name="solve")
-    install_model(loop, [message([text_block("stopping")])])
-    desk = FakeDesk()
+    fake = install_model(loop, [message([text_block("stopping")])])
+    side = FakeSide()
 
     cli._run_interactive(
         loop, backend, store, view, Browser(backend, store),
-        ScriptedReader(["what is it doing?", "/exit"]), concierge=desk,
+        ScriptedReader(["/btw what is it doing?", "/exit"]), side=side,
     )
 
-    assert "what is it doing?" in desk.asked
+    assert side.asked == ["what is it doing?"]
+    assert fake.calls == [], "no turn was started for it"
+
+
+def test_a_side_question_at_the_prompt_starts_no_turn(loop, backend, store, view, quiet_console):
+    fake = install_model(loop, [message([text_block("hi")])])
+    side = FakeSide()
+
+    cli._run_interactive(
+        loop, backend, store, view, Browser(backend, store),
+        ScriptedReader(["/btw what did you find?", "/exit"]), side=side,
+    )
+
+    assert side.asked == ["what did you find?"]
+    assert fake.calls == [] and loop.messages == []
+
+
+def test_a_provider_400_ends_the_turn_with_an_event_the_person_can_see(
+    ctx, store, view, quiet_console
+):
+    """The Bedrock refusal that moved routing out of the agent (`desk.py`) ended its
+    turn with an empty assistant row and nothing else in the record: the notice was
+    live-only, and a page loaded afterwards showed an agent that stopped talking."""
+    import anthropic
+    from types import SimpleNamespace
+
+    said = ("messages.1.content.0: Invalid `signature` in `thinking` block. The block is "
+            "bound to a different conversation. The `system` prompt and the `tools` list "
+            "both differ from when this block was created.")
+
+    class Refusing:
+        def stream(self, **kwargs):
+            raise anthropic.BadRequestError(
+                said, response=SimpleNamespace(status_code=400, headers={}, request=None),
+                body=None)
+
+    loop = Loop(Config(llm_api_key="k", model="claude-opus-5-5"), ctx, store, view)
+    loop.client = SimpleNamespace(messages=Refusing())
+    loop.say("go")
+
+    assert cli._run_turn(loop, view) is False
+
+    events = [r["content"] for r in store.recent_messages(20) if r["role"] == "event"]
+    assert any(e.startswith("The model request failed, so this turn ended:")
+               and "Invalid `signature`" in e for e in events)
+    assert any("Invalid `signature`" in n for n in view.notices)
 
 
 # -- push (upload) -------------------------------------------------------------
@@ -1195,20 +1909,6 @@ def test_a_completed_turn_resets_the_failure_count(loop, view, monkeypatch):
     assert loop.api_failures == 0
 
 
-def test_a_failed_prompt_turn_reaches_the_desk(loop, backend, store, view, quiet_console, monkeypatch):
-    """When a turn typed at the prompt fails, the desk still answers -- the reason
-    someone types 'are you still working?' is that the agent went quiet."""
-    monkeypatch.setattr(loop, "run", lambda: (_ for _ in ()).throw(_api_error()))
-    desk = FakeDesk()
-
-    cli._run_interactive(
-        loop, backend, store, view, Browser(backend, store),
-        ScriptedReader(["are you still working?", "/exit"]), concierge=desk,
-    )
-
-    assert "are you still working?" in desk.asked
-
-
 def test_an_empty_key_is_not_reported_as_set():
     assert cli._redact("") == ""
     assert cli._redact("short") == "set"
@@ -1272,6 +1972,199 @@ def test_login_reports_a_service_that_cannot_be_reached(monkeypatch, tmp_path):
     result = CliRunner().invoke(cli.main, ["login", "--browser", "--no-browser", "--service", "https://nowhere.example"])
     assert result.exit_code == 1
     assert "nowhere.example" in result.output
+
+
+def _no_model_settings(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENREYNOLDS_CONFIG", str(tmp_path / "c.json"))
+    for name in ("FOAMD_API_KEY", "FOAMD_URL", "OPENREYNOLDS_PROVIDER", "OPENREYNOLDS_MODEL",
+                 "OPENREYNOLDS_LLM_API_KEY", "OPENREYNOLDS_LLM_BASE_URL",
+                 "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+
+
+def _browser_login(monkeypatch, answers):
+    """A code flow whose polls answer, in order, with `answers` (an exception is raised)."""
+    monkeypatch.setattr(cli.hosted, "device_code", lambda url, name: {
+        "device_code": "dc", "user_code": "K7QF-M2ZR", "expires_in": 600, "interval": 1})
+    polls = []
+
+    def token(url, device):
+        polls.append(device)
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    monkeypatch.setattr(cli.hosted, "device_token", token)
+    return polls
+
+
+def test_login_keeps_waiting_through_a_gateway_error_and_a_dropped_connection(monkeypatch, tmp_path):
+    """A 502 from the edge while the person was approving the code ended the sign-in,
+    and the code with it: the page then said no terminal was waiting."""
+    _no_model_settings(monkeypatch, tmp_path)
+    polls = _browser_login(monkeypatch, [
+        None,
+        BackendError("<html>502 Bad Gateway</html>", code="http_error", status=502),
+        BackendError("cannot reach the service: reset", code="unreachable"),
+        BackendError("slow down", code="rate_limited", status=429),
+        {"api_key": "of_live_newkey", "name": "laptop"},
+    ])
+
+    result = CliRunner().invoke(cli.main, ["login", "--browser", "--no-browser"])
+
+    assert result.exit_code == 0, result.output
+    assert len(polls) == 5
+    assert json.loads((tmp_path / "c.json").read_text())["foamd_api_key"] == "of_live_newkey"
+    assert result.output.count("still waiting") == 1
+    assert "HTTP 502" in result.output and "<html>" not in result.output
+
+
+def test_login_stops_when_the_service_refuses_the_code(monkeypatch, tmp_path):
+    _no_model_settings(monkeypatch, tmp_path)
+    polls = _browser_login(monkeypatch, [
+        BackendError("This code was denied.", code="access_denied", status=400),
+        {"api_key": "never", "name": "laptop"},
+    ])
+
+    result = CliRunner().invoke(cli.main, ["login", "--browser", "--no-browser"])
+
+    assert result.exit_code == 1
+    assert len(polls) == 1
+    assert "denied" in result.output
+    assert not (tmp_path / "c.json").exists()
+
+
+def test_login_backs_off_when_rate_limited(monkeypatch, tmp_path):
+    _no_model_settings(monkeypatch, tmp_path)
+    waits = []
+    monkeypatch.setattr(cli.time, "sleep", waits.append)
+    _browser_login(monkeypatch, [
+        BackendError("slow down", code="rate_limited", status=429),
+        BackendError("slow down", code="rate_limited", status=429),
+        {"api_key": "of_live_newkey", "name": "laptop"},
+    ])
+
+    result = CliRunner().invoke(cli.main, ["login", "--browser", "--no-browser"])
+
+    assert result.exit_code == 0, result.output
+    assert waits == [1.0, 2.0, 4.0]
+
+
+def test_a_permanent_server_error_is_not_waited_through(monkeypatch, tmp_path):
+    _no_model_settings(monkeypatch, tmp_path)
+    polls = _browser_login(monkeypatch, [
+        BackendError("Not Implemented", code="http_error", status=501),
+        {"api_key": "never", "name": "laptop"},
+    ])
+
+    result = CliRunner().invoke(cli.main, ["login", "--browser", "--no-browser"])
+
+    assert result.exit_code == 1
+    assert len(polls) == 1
+
+
+def test_a_key_handed_over_on_a_lost_reply_is_named_as_that(monkeypatch, tmp_path):
+    """The service hands the key over exactly once and answers 410 after. When the
+    reply carrying it was lost, the next poll's 410 is not a code that was never used."""
+    _no_model_settings(monkeypatch, tmp_path)
+    _browser_login(monkeypatch, [
+        BackendError("Gateway Timeout", code="http_error", status=504),
+        BackendError("this device code was already used", code="gone", status=410),
+    ])
+
+    result = CliRunner().invoke(cli.main, ["login", "--browser", "--no-browser"])
+
+    assert result.exit_code == 1
+    out = " ".join(result.output.split())
+    assert "reply that was lost" in out and "Machines" in out
+    assert not (tmp_path / "c.json").exists()
+
+
+def test_a_code_that_expires_during_an_outage_says_so(monkeypatch, tmp_path):
+    _no_model_settings(monkeypatch, tmp_path)
+    clock = iter([0.0, 0.0, 1.0, 2.0, 999.0])
+    monkeypatch.setattr(cli.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(cli.hosted, "device_code", lambda url, name: {
+        "device_code": "dc", "user_code": "X", "expires_in": 10, "interval": 1})
+    monkeypatch.setattr(cli.hosted, "device_token", lambda url, device: (_ for _ in ()).throw(
+        BackendError("Bad Gateway", code="http_error", status=502)))
+
+    result = CliRunner().invoke(cli.main, ["login", "--browser", "--no-browser"])
+
+    assert result.exit_code == 1
+    assert "while the service was not answering" in " ".join(result.output.split())
+
+
+@pytest.mark.parametrize("name, value", [
+    ("OPENAI_API_KEY", "sk-own"),
+    ("OPENREYNOLDS_LLM_BASE_URL", "http://localhost:11434/v1"),
+    ("OPENREYNOLDS_LLM_API_KEY", "own"),
+])
+def test_sign_in_never_moves_a_machine_that_brought_its_own_model(monkeypatch, tmp_path, name, value):
+    _no_model_settings(monkeypatch, tmp_path)
+    monkeypatch.delenv("OPENREYNOLDS_LLM_BASE_URL", raising=False)
+    monkeypatch.setenv(name, value)
+    _browser_login(monkeypatch, [{"api_key": "of_live_newkey", "name": "laptop"}])
+
+    result = CliRunner().invoke(cli.main, ["login", "--browser", "--no-browser"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads((tmp_path / "c.json").read_text()).get("provider") != "reynolds"
+
+
+def test_a_first_sign_in_with_no_model_key_uses_reynolds_model(monkeypatch, tmp_path):
+    _no_model_settings(monkeypatch, tmp_path)
+    _browser_login(monkeypatch, [{"api_key": "of_live_newkey", "name": "laptop"}])
+
+    result = CliRunner().invoke(cli.main, ["login", "--browser", "--no-browser"])
+
+    assert result.exit_code == 0, result.output
+    saved = json.loads((tmp_path / "c.json").read_text())
+    assert saved["provider"] == "reynolds"
+    out = " ".join(result.output.split())
+    assert "Reynolds' model, metered to your plan" in out
+    assert "model key is still needed" not in out
+    assert cli.Config.load().model_key_missing() is None
+
+
+def test_sign_in_keeps_the_persons_own_model_key(monkeypatch, tmp_path):
+    _no_model_settings(monkeypatch, tmp_path)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-own")
+    _browser_login(monkeypatch, [{"api_key": "of_live_newkey", "name": "laptop"}])
+
+    result = CliRunner().invoke(cli.main, ["login", "--browser", "--no-browser"])
+
+    assert result.exit_code == 0, result.output
+    saved = json.loads((tmp_path / "c.json").read_text())
+    assert saved.get("provider") == "anthropic"
+    assert "metered to your plan" not in result.output
+
+
+def test_sign_in_keeps_a_provider_someone_chose_and_says_how_to_switch(monkeypatch, tmp_path):
+    _no_model_settings(monkeypatch, tmp_path)
+    (tmp_path / "c.json").write_text(json.dumps({"provider": "openai"}))
+    _browser_login(monkeypatch, [{"api_key": "of_live_newkey", "name": "laptop"}])
+
+    result = CliRunner().invoke(cli.main, ["login", "--browser", "--no-browser"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads((tmp_path / "c.json").read_text())["provider"] == "openai"
+    out = " ".join(result.output.split())
+    assert "model key is still needed" in out
+    assert "openreynolds config --provider reynolds" in out
+
+
+def test_a_password_sign_in_with_no_model_key_uses_reynolds_model_too(monkeypatch, tmp_path):
+    _no_model_settings(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "_can_prompt", lambda: True)
+    _auth_stubs(monkeypatch, sessions=[{"access_token": "jwt-1"}])
+
+    result = CliRunner().invoke(cli.main, ["login"], input="a@example.com\npw\n")
+
+    assert result.exit_code == 0, result.output
+    assert json.loads((tmp_path / "c.json").read_text())["provider"] == "reynolds"
 
 
 def _auth_stubs(monkeypatch, *, sessions, signups=None, minted=None, terms=None):
@@ -1353,6 +2246,54 @@ def test_login_declining_to_create_an_account_changes_nothing(monkeypatch, tmp_p
     assert not (tmp_path / "c.json").exists()
 
 
+def test_a_refused_sign_in_names_the_flow_a_google_account_actually_has(
+    monkeypatch, tmp_path
+):
+    """An account created with Google has no password, so signing in fails exactly
+    like a wrong one -- and the only thing said next was an offer to create a second
+    account for an address that already has one. `--browser` is the working path."""
+    monkeypatch.setenv("OPENREYNOLDS_CONFIG", str(tmp_path / "c.json"))
+    monkeypatch.setattr(cli, "_can_prompt", lambda: True)
+    refused = BackendError("Invalid login credentials", code="invalid_credentials", status=400)
+    _auth_stubs(monkeypatch, sessions=[refused])
+
+    result = CliRunner().invoke(cli.main, ["login"], input="g@example.com\nwhatever\nn\n")
+
+    assert "Google" in result.output
+    assert "login --browser" in result.output
+
+
+def test_the_login_help_says_which_flow_a_password_less_account_needs(monkeypatch):
+    result = CliRunner().invoke(cli.main, ["login", "--help"])
+    assert "--browser" in result.output
+    assert "Google" in result.output
+
+
+def test_a_terminal_signup_learns_what_a_web_signup_is_told_about_credit(
+    monkeypatch, tmp_path
+):
+    """The web signup says it and the terminal did not, so the same account created
+    two ways learned two different things about what it was starting with.
+
+    Deliberately not checked here: which addresses count. The domain list lives on the
+    service, and a copy in the client goes stale and starts telling people the
+    opposite of what they are about to get."""
+    monkeypatch.setenv("OPENREYNOLDS_CONFIG", str(tmp_path / "c.json"))
+    monkeypatch.setattr(cli, "_can_prompt", lambda: True)
+    refused = BackendError("Invalid login credentials", code="invalid_credentials", status=400)
+    _auth_stubs(monkeypatch, sessions=[refused])
+
+    result = CliRunner().invoke(cli.main, ["login"], input="new@example.com\npw\nn\n")
+
+    assert "15 full-depth studies" in " ".join(result.output.split()) and "$" not in result.output
+    assert "30-day starter trial" in " ".join(result.output.lower().split())
+    import inspect
+
+    assert "gmail" not in inspect.getsource(cli._offer_account).lower(), (
+        "no local guess about which addresses are company addresses"
+    )
+
+
 def test_login_without_a_terminal_needs_the_flags(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENREYNOLDS_CONFIG", str(tmp_path / "c.json"))
     monkeypatch.setattr(cli, "_can_prompt", lambda: False)
@@ -1400,6 +2341,187 @@ def test_a_refusal_stops_the_harness_asking_again(loop, view, quiet_console):
     assert any("402" in n for n in view.notices), "the page hears it, not just the console"
     assert "refusal, not a hiccup" in quiet_console.file.getvalue() if hasattr(
         quiet_console.file, "getvalue") else True
+
+
+@pytest.fixture
+def heard_console(monkeypatch):
+    import io
+
+    from rich.console import Console
+
+    console = Console(file=io.StringIO(), force_terminal=False, width=400)
+    monkeypatch.setattr(cli, "console", console)
+    return console
+
+
+def _service_refusal(status, body):
+    """A model call refused by foamd's proxy, carrying its body as the SDK hands it on."""
+    import anthropic
+    import httpx2 as real_httpx
+    from openreynolds.llm import ProviderError
+
+    response = real_httpx.Response(status, json=body, request=real_httpx.Request(
+        "POST", "https://svc.example/v1/llm/v1/messages"))
+    sdk = anthropic.APIStatusError(body["message"], response=response, body=body)
+    try:
+        raise ProviderError(body["message"], status) from sdk
+    except ProviderError as exc:
+        return exc
+
+
+def _days_from_now(days):
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+
+
+_SOON = _days_from_now(20)
+_LATER = _days_from_now(200)
+_GONE = _days_from_now(-3)
+
+_PAYG = "turning on pay-as-you-go overage (billed to your card)"
+
+# The 402 `allowance_exhausted` bodies a D18 service sends, one per kind of account: what
+# the person must and must not be told for each, and the renewal day that may be named.
+# `renews_at` is the day the allowance refills on its own (D18) and the only one a
+# renewal is named from; `period_end` is said only by a server that sends no
+# `renews_at`, and then only while it is ahead and the account is not past due.
+_ALLOWANCE_CASES = {
+    "monthly, overage allowed": (
+        {"tier": "starter", "period_end": _SOON, "renews_at": _SOON,
+         "can_enable_overage": True, "can_buy_credits": True, "past_due": False},
+        ["buying credits", _PAYG, f"renews on {_SOON[:10]}"],
+        ["payment failed"], _SOON[:10]),
+    "annual paid, overage allowed": (
+        {"tier": "pro", "period_end": _LATER, "renews_at": _LATER,
+         "can_enable_overage": True, "can_buy_credits": True, "past_due": False},
+        ["buying credits", _PAYG, f"renews on {_LATER[:10]}"],
+        ["payment failed"], _LATER[:10]),
+    "personal trial, renews into Starter": (
+        {"tier": "starter", "period_end": _SOON, "renews_at": _SOON,
+         "can_enable_overage": False, "can_buy_credits": True, "past_due": False},
+        ["buying credits", "a bigger plan", f"renews on {_SOON[:10]}"],
+        ["overage", "payment failed"], _SOON[:10]),
+    "work trial": (
+        {"tier": "pro", "period_end": _SOON, "renews_at": None,
+         "can_enable_overage": False, "can_buy_credits": True, "past_due": False},
+        ["buying credits", "a bigger plan"],
+        ["renews", _SOON[:10], "overage", "payment failed"], None),
+    "cancel scheduled": (
+        {"tier": "starter", "period_end": _SOON, "renews_at": None,
+         "can_enable_overage": True, "can_buy_credits": True, "past_due": False},
+        ["buying credits", _PAYG],
+        ["renews", _SOON[:10], "payment failed"], None),
+    "past due": (
+        {"tier": "starter", "period_end": _SOON, "renews_at": None,
+         "can_enable_overage": False, "can_buy_credits": True, "past_due": True},
+        ["your last payment failed",
+         "update your card from the account page at https://app.tryreynolds.com", "buying credits"],
+        ["overage", "renews", _SOON[:10]], None),
+    "no plan": (
+        {"tier": None, "period_end": None, "renews_at": None, "can_enable_overage": False,
+         "can_buy_credits": True, "past_due": False},
+        ["no active plan", "buying credits", "picking a plan"],
+        ["overage", "renews", "payment failed"], None),
+    "staff, or billing not configured": (
+        {"tier": "max", "period_end": None, "renews_at": None, "can_enable_overage": False,
+         "can_buy_credits": False, "past_due": False},
+        ["a bigger plan"],
+        ["credits", "overage", "renews", "payment failed"], None),
+    "a renewal sent that has already passed": (
+        {"tier": "starter", "period_end": _GONE, "renews_at": _GONE,
+         "can_enable_overage": False, "can_buy_credits": True, "past_due": False},
+        ["a bigger plan"],
+        ["renews", _GONE[:10]], None),
+    "an older server without renews_at, a period ahead": (
+        {"tier": "starter", "period_end": _SOON, "can_enable_overage": True,
+         "can_buy_credits": True, "past_due": False},
+        ["buying credits", _PAYG, f"renews on {_SOON[:10]}"],
+        ["payment failed"], _SOON[:10]),
+    "an older server without renews_at, past due": (
+        {"tier": "starter", "period_end": _SOON, "can_enable_overage": False,
+         "can_buy_credits": True, "past_due": True},
+        ["your last payment failed", "account page at https://app.tryreynolds.com"],
+        ["renews", _SOON[:10]], None),
+    "an older server, a period that has passed": (
+        {"tier": "starter", "period_end": _GONE, "can_enable_overage": False},
+        ["a bigger plan"],
+        ["renews", "credits", "overage", _GONE[:10]], None),
+}
+
+
+@pytest.mark.parametrize("case", list(_ALLOWANCE_CASES))
+def test_a_spent_allowance_offers_only_what_the_account_can_do(loop, view, heard_console, case):
+    """The 402's fields decide each offer (D15, D18, D19): credits when they can be
+    bought, pay-as-you-go overage only when it can be turned on, a renewal day only from
+    `renews_at`, and the card when the last payment failed -- never one sentence for
+    every account. A work trial and a plan set to cancel were told "it renews on" a day
+    their allowance would never refill."""
+    fields, said_in, never, _ = _ALLOWANCE_CASES[case]
+    body = {"error": "allowance_exhausted", "message": "this period's allowance is used up.",
+            **fields}
+    loop.run = lambda: (_ for _ in ()).throw(_service_refusal(402, body))
+
+    assert cli._run_turn(loop, view) is False
+    assert loop.blocked_reason and "402" in loop.blocked_reason
+    said = " ".join(heard_console.file.getvalue().split())
+    for words in said_in:
+        assert words in said, (case, words, said)
+    for words in never:
+        assert words not in said, (case, words, said)
+
+
+@pytest.mark.parametrize("case", list(_ALLOWANCE_CASES))
+def test_the_facts_beside_the_message_follow_the_same_fields(case):
+    """`extra_note`, said beside the service's message on every workspace call and model
+    call, makes the same offers in a few words."""
+    from openreynolds.backend.base import extra_note
+
+    fields, _, _, day = _ALLOWANCE_CASES[case]
+    note = extra_note(fields)
+    assert ("credits can be bought" in note) == bool(fields.get("can_buy_credits"))
+    assert ("pay-as-you-go overage (billed to your card) can be turned on" in note) == bool(
+        fields.get("can_enable_overage"))
+    assert ("last payment failed; update your card from the account page at "
+            "https://app.tryreynolds.com" in note) == bool(fields.get("past_due"))
+    assert ("renews" in note) == bool(day), note
+    if day:
+        assert f"renews {day}" in note
+
+
+def test_a_renewal_is_named_from_renews_at_when_it_differs_from_the_period():
+    """`renews_at` is the day the allowance refills; `period_end` stays as it was and
+    is not a renewal when `renews_at` says otherwise."""
+    from openreynolds.backend.base import renewal_day
+
+    assert renewal_day({"period_end": _SOON, "renews_at": _LATER}) == _LATER[:10]
+    assert renewal_day({"period_end": _SOON, "renews_at": None}) is None
+    assert renewal_day({"period_end": _SOON, "renews_at": "soon"}) is None
+
+
+def test_a_renewal_day_that_is_not_a_date_is_left_out():
+    from openreynolds.backend.base import extra_note
+
+    assert extra_note({"tier": "starter", "period_end": "soon"}) == "plan: Starter"
+
+
+def test_a_service_before_plans_still_says_budget(loop, view, heard_console):
+    body = {"error": "budget_exhausted", "message": "credit exhausted"}
+    loop.run = lambda: (_ for _ in ()).throw(_service_refusal(402, body))
+
+    assert cli._run_turn(loop, view) is False
+    assert "a budget or a usage cap" in heard_console.file.getvalue()
+
+
+def test_a_plan_limit_on_a_model_call_blocks_and_names_the_upgrade(loop, view, heard_console):
+    loop.run = lambda: (_ for _ in ()).throw(_service_refusal(403, {
+        "error": "plan_limit", "message": "max_concurrent 2 is over the limit.",
+        "limit": "max_concurrent", "value": 2, "allowed": 1, "tier": "starter",
+        "upgrade_to": "pro"}))
+
+    assert cli._run_turn(loop, view) is False
+    assert "upgrade to Pro" in loop.blocked_reason
+    assert "the plan does not allow this" in heard_console.file.getvalue()
 
 
 @pytest.mark.parametrize("status", [400, 401, 402, 403, 404, 413])
@@ -1589,3 +2711,330 @@ def test_a_level_typed_at_the_prompt_goes_into_the_thread(
 
     assert loop.cfg.ambition == "thorough"
     assert "`thorough`" in loop.messages[0]["content"]
+
+
+# -- /mesh: the person talking to the CAD desk ---------------------------------
+
+
+class SpyDesk:
+    """A CAD desk that records what it was asked for and answers instantly."""
+
+    def __init__(self):
+        self.calls = []
+
+    def run(self, request, case=None, geometry="", inputs=()):
+        self.calls.append({"request": request, "inputs": list(inputs)})
+        return type("R", (), {"tokens": {}, "png": None, "check": None, "ok": True,
+                              "error": "", "case_rel": "cad", "summary": "built it",
+                              "steps": [], "seconds": 1.0, "stopped": "done",
+                              "remarks": []})()
+
+
+def mesh_line(line, loop, view, browser, store, backend, cad):
+    from openreynolds import commands
+    return cli._apply(commands.parse(line), loop, view, browser, store,
+                      cad=cad, backend=backend)
+
+
+def test_mesh_reaches_the_desk_without_a_model_turn(loop, backend, store, view):
+    """The point of the command: the person's own words, not the agent's reading of
+    them, and no turn in front of it."""
+    browser = Browser(backend, store)
+    desk = SpyDesk()
+    spoken = mesh_line("/mesh a 10 mm U-bend in water", loop, view, browser, store,
+                       backend, desk)
+    assert spoken is None, "a /mesh must not also be said to the model"
+    assert desk.calls == [{"request": "a 10 mm U-bend in water", "inputs": []}]
+
+
+def test_mesh_hands_over_every_file_marked_with_at(loop, backend, store, view):
+    browser = Browser(backend, store)
+    desk = SpyDesk()
+    backend.files["/work/u/plan.png"] = b"\x89PNG\r\n"
+    backend.files["/work/u/rooms.csv"] = b"room,w\n"
+    mesh_line("/mesh trace @/work/u/plan.png with @/work/u/rooms.csv", loop, view,
+              browser, store, backend, desk)
+    assert desk.calls[0]["inputs"] == ["/work/u/plan.png", "/work/u/rooms.csv"]
+    assert desk.calls[0]["request"] == "trace /work/u/plan.png with /work/u/rooms.csv"
+
+
+def test_a_handed_over_file_that_is_not_there_costs_a_stat_not_a_build(
+    loop, backend, store, view
+):
+    browser = Browser(backend, store)
+    desk = SpyDesk()
+    mesh_line("/mesh trace @/work/u/absent.png", loop, view, browser, store, backend,
+              desk)
+    assert desk.calls == [], "a refusal that started a desk is not a refusal"
+
+
+def test_mesh_without_a_desk_says_so_rather_than_failing(loop, backend, store, view):
+    browser = Browser(backend, store)
+    spoken = mesh_line("/mesh a duct", loop, view, browser, store, backend, None)
+    assert spoken is None
+
+
+def test_mesh_typed_mid_turn_is_refused_rather_than_dropped(loop, backend, store, view):
+    """The kernel is sequential and the agent may be inside a desk run of its own, so
+    a second desk started from under it would queue and come back having done nothing.
+    Before this the line fell through the local dispatch and vanished."""
+    browser = Browser(backend, store)
+    reader = ScriptedReader(["/mesh a duct", None])
+    spoken = cli._typed_while_working(loop, view, browser, store, reader)
+    assert spoken is None, "a mid-turn /mesh must not be sent to the model as prose"
+    assert any("prompt is back" in str(line) for line in view.warnings), view.warnings
+
+# -- saying which of several workspaces was joined ------------------------------
+
+
+def test_the_join_notice_names_the_instance_it_chose_when_there_was_more_than_one():
+    """The service's cap on concurrent instances is no longer 1, so `acquire()` picking
+    the most recently active workspace is a choice and not an only option. Silent, that
+    choice opens a session on a Volume where the study's files are not, which reads as a
+    workspace that lost them. The notice therefore says how many the account holds and
+    that `--instance` picks a different one -- the flag already exists, so this is a
+    sentence, not a mechanism."""
+    notice = cli._join_notice("iid-abcdefgh-and-more", 5)
+
+    assert "iid-abcd" in notice, "the one it took is named"
+    assert "5 workspaces" in notice
+    assert "the other 4 have their own files" in notice
+    assert "--instance" in notice
+
+
+def test_the_join_notice_says_nothing_about_others_when_there_is_only_one():
+    """The sharing warning is the old message word for word, because the account that
+    holds one workspace is every account today and its notice must not grow a sentence
+    about workspaces it does not have. A count of 0 means nobody counted -- `acquire()`
+    was told which instance to use -- and is treated the same way."""
+    for held in (0, 1):
+        notice = cli._join_notice("iid-abcdefgh", held)
+        assert "another session may be using it" in notice
+        assert "workspaces" not in notice
+        assert "--instance" not in notice
+
+
+# -- a transient failure is asked again ---------------------------------------
+
+
+def _failing_then(loop, errors):
+    """`loop.run` raising each of `errors` in turn, then completing."""
+    calls = []
+    errors = list(errors)
+
+    def run():
+        calls.append(1)
+        if errors:
+            raise errors.pop(0)
+
+    loop.run = run
+    return calls
+
+
+def test_a_rate_limited_turn_is_retried_rather_than_ended(loop, view, store, quiet_console):
+    """2026-10-19: five studies met foamd's limiter (`429 rate_limited ... retry in 1s`)
+    with no job running. Each turn ended, nothing was left to wake the agent, and every
+    one of them sat in "your turn" with nothing said until it was ended by hand."""
+    calls = _failing_then(loop, [_api_error(429), _api_error(503), _api_error(None)])
+
+    assert cli._run_turn(loop, view) is True
+    assert len(calls) == 4
+    assert loop.api_failures == 0 and loop.blocked_reason is None
+    events = [r["content"] for r in store.recent_messages(20) if r["role"] == "event"]
+    assert not any(e.startswith("The model request failed") for e in events), \
+        "a turn that went through is not recorded as failed"
+
+
+def test_a_retried_turn_says_it_is_still_the_agents_move(loop, view, quiet_console, monkeypatch):
+    working = []
+    monkeypatch.setattr(view, "working", working.append, raising=False)
+    _failing_then(loop, [_api_error(429)])
+
+    assert cli._run_turn(loop, view) is True
+    assert working and "trying again" in working[0]
+
+
+def test_retries_end_once_the_waits_are_spent(loop, view, store, quiet_console):
+    from openreynolds.llm import base
+
+    calls = _failing_then(loop, [_api_error(429)] * 99)
+
+    assert cli._run_turn(loop, view) is False
+    assert len(calls) == len(base.TRANSIENT_WAITS) + 1
+    assert loop.api_failures == 1, "one failed turn, however many tries it took"
+    events = [r["content"] for r in store.recent_messages(20) if r["role"] == "event"]
+    assert sum(e.startswith("The model request failed") for e in events) == 1
+
+
+@pytest.mark.parametrize("status", [400, 401, 402, 403, 404, 413])
+def test_a_refusal_is_not_retried(loop, view, quiet_console, status):
+    calls = _failing_then(loop, [_api_error(status)] * 99)
+    assert cli._run_turn(loop, view) is False
+    assert len(calls) == 1
+
+
+def test_leaving_during_a_retry_wait_stops_the_retries(loop, view, quiet_console):
+    calls = _failing_then(loop, [_api_error(429)] * 99)
+    loop.leaving = True
+
+    assert cli._run_turn(loop, view) is False
+    assert len(calls) == 1
+
+
+def test_words_typed_during_a_retry_wait_reach_the_thread(loop, view, quiet_console):
+    calls = _failing_then(loop, [_api_error(429)])
+    typed = ["are you still there?"]
+
+    def heard():
+        if typed:
+            loop._typed.append(typed.pop())
+        return bool(loop._typed)
+
+    loop.heard = heard
+    loop.say("go")
+
+    assert cli._run_turn(loop, view) is True
+    assert len(calls) == 2
+    assert loop.messages[-1] == {"role": "user", "content": "are you still there?"}
+
+
+def test_retry_after_lengthens_a_wait_but_never_shortens_it():
+    from types import SimpleNamespace
+    from openreynolds.llm import ProviderError, base
+
+    def raised(after):
+        cause = Exception()
+        cause.response = SimpleNamespace(headers={"retry-after": after})
+        exc = ProviderError("rate_limited", 429)
+        exc.__cause__ = cause
+        return exc
+
+    assert base.retry_delay(raised("1"), 0) == base.TRANSIENT_WAITS[0]
+    assert base.retry_delay(raised("90"), 0) == 90
+    assert base.retry_delay(raised("99999"), 0) == base.MAX_RETRY_AFTER
+    assert base.retry_delay(raised("Wed, 21 Oct 2026 07:28:00 GMT"), 1) == base.TRANSIENT_WAITS[1]
+    assert base.retry_delay(ProviderError("x", 429), len(base.TRANSIENT_WAITS)) is None
+    assert base.retry_delay(ProviderError("x", 402), 0) is None
+
+
+
+def _signed_in_machine(monkeypatch, tmp_path, *, revoke=None):
+    """A config file with a key and other settings, a queued trace, and the service's
+    revoke faked: `revoke` answers it (an outcome, or an exception to raise)."""
+    path = tmp_path / "c.json"
+    monkeypatch.setenv("OPENREYNOLDS_CONFIG", str(path))
+    monkeypatch.delenv("FOAMD_API_KEY", raising=False)
+    monkeypatch.delenv("FOAMD_URL", raising=False)
+    monkeypatch.setenv("OPENREYNOLDS_MODEL", "from-the-environment")
+    path.write_text(json.dumps({"foamd_url": "https://api.example", "foamd_api_key": "of_live_x", "model": "m1"}))
+    queue = cli.sharing_mod.queue_dir()
+    queue.mkdir(parents=True, exist_ok=True)
+    (queue / "t.json.gz").write_bytes(b"x")
+    asked = []
+
+    def revoke_own_key(url, key):
+        asked.append((url, key))
+        if isinstance(revoke, Exception):
+            raise revoke
+        return revoke or "revoked"
+
+    monkeypatch.setattr(cli.hosted, "revoke_own_key", revoke_own_key)
+    return path, queue, asked
+
+
+def _logout_said(result):
+    return " ".join(result.output.split())
+
+
+def test_logout_revokes_the_key_then_removes_it_and_the_queue(monkeypatch, tmp_path):
+    path, queue, asked = _signed_in_machine(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli.main, ["logout"])
+
+    assert result.exit_code == 0, result.output
+    assert asked == [("https://api.example", "of_live_x")]
+    assert "Signed out." in _logout_said(result) and "revoked on the service" in _logout_said(result)
+    assert "1 queued trace deleted" in _logout_said(result)
+    # Only the key goes: nothing the environment set is written into the file.
+    assert json.loads(path.read_text()) == {"foamd_url": "https://api.example", "model": "m1"}
+    assert not list(queue.iterdir())
+    assert "of_live_x" not in result.output
+
+
+def test_logout_changes_nothing_when_the_service_cannot_revoke(monkeypatch, tmp_path):
+    path, queue, _asked = _signed_in_machine(
+        monkeypatch, tmp_path, revoke=cli.BackendError("cannot reach", code="unreachable"))
+    before = path.read_text()
+
+    result = CliRunner().invoke(cli.main, ["logout"])
+
+    assert result.exit_code == 1
+    assert "nothing was changed" in _logout_said(result) and "--here-only" in _logout_said(result)
+    assert path.read_text() == before and list(queue.iterdir())
+
+
+def test_logout_here_only_removes_the_key_without_asking_the_service(monkeypatch, tmp_path):
+    path, _queue, asked = _signed_in_machine(monkeypatch, tmp_path)
+
+    result = CliRunner().invoke(cli.main, ["logout", "--here-only"])
+
+    assert result.exit_code == 0, result.output
+    assert asked == [] and "stays valid on the service" in _logout_said(result)
+    assert "foamd_api_key" not in json.loads(path.read_text())
+
+
+def test_logout_against_a_service_that_cannot_revoke_says_the_key_still_works(monkeypatch, tmp_path):
+    path, _queue, _asked = _signed_in_machine(monkeypatch, tmp_path, revoke="unsupported")
+
+    result = CliRunner().invoke(cli.main, ["logout"])
+
+    assert result.exit_code == 0, result.output
+    assert "cannot revoke keys yet" in _logout_said(result) and "stays valid there" in _logout_said(result)
+    assert "foamd_api_key" not in json.loads(path.read_text())
+
+
+def test_logout_with_an_environment_key_too_does_not_claim_to_be_signed_out(monkeypatch, tmp_path):
+    path, _queue, asked = _signed_in_machine(monkeypatch, tmp_path)
+    monkeypatch.setenv("FOAMD_API_KEY", "of_live_env")
+
+    result = CliRunner().invoke(cli.main, ["logout"])
+
+    assert result.exit_code == 0, result.output
+    assert asked == [("https://api.example", "of_live_x")], "the file's key is the one revoked"
+    assert "Signed out" not in result.output and "Still signed in through FOAMD_API_KEY" in _logout_said(result)
+    assert json.loads(path.read_text()) == {"foamd_url": "https://api.example", "model": "m1"}
+    assert "of_live_env" not in path.read_text()
+
+
+def test_logout_with_an_unreadable_config_changes_nothing_and_says_why(monkeypatch, tmp_path):
+    path, queue, asked = _signed_in_machine(monkeypatch, tmp_path)
+    path.write_text('{"foamd_api_key": "of_live_x",')
+
+    result = CliRunner().invoke(cli.main, ["logout"])
+
+    assert result.exit_code == 1
+    assert "cannot be read" in _logout_said(result) and "nothing to remove" not in result.output
+    assert asked == [] and path.read_text() == '{"foamd_api_key": "of_live_x",' and list(queue.iterdir())
+
+
+def test_logout_prints_a_config_path_with_brackets_as_it_is(monkeypatch, tmp_path):
+    folder = tmp_path / "[bold]work"
+    folder.mkdir()
+    path, _queue, _asked = _signed_in_machine(monkeypatch, folder)
+
+    result = CliRunner().invoke(cli.main, ["logout"])
+
+    assert result.exit_code == 0, result.output
+    assert "[bold]work" in _logout_said(result)
+
+
+def test_logout_with_no_key_saved_says_so_and_names_an_environment_key(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENREYNOLDS_CONFIG", str(tmp_path / "c.json"))
+    monkeypatch.setenv("FOAMD_API_KEY", "of_live_env")
+    monkeypatch.setattr(cli.hosted, "revoke_own_key", lambda url, key: pytest.fail("nothing to revoke"))
+
+    result = CliRunner().invoke(cli.main, ["logout"])
+
+    assert result.exit_code == 0, result.output
+    assert "nothing to remove" in _logout_said(result) and "Still signed in through FOAMD_API_KEY" in _logout_said(result)
+    assert not (tmp_path / "c.json").exists()

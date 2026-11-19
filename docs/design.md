@@ -35,12 +35,14 @@ The agent decides everything about how to work. The harness is plumbing. Concret
 - post capture records (messages, results, artifacts) to the platform;
 - assemble a factual situation blurb on resume (instance id, running jobs and their statuses — no interpretation).
 
-**The harness MUST NOT:**
+**The harness MUST NOT** (in the default mode, and in the other two for anything the person did not ask to have gated):
 - enforce any ordering of actions, phases, or "check X before Y";
 - block or rewrite a tool call on policy grounds;
 - require approvals, verdicts, or sign-offs before anything runs;
 - inject step-by-step instructions, checklists, or mandated workflows — in the system prompt, in wake messages, or in any file the agent is required to obey;
 - grade, veto, or amend the model's outputs.
+
+**When the person chooses to be consulted.** Everything above holds, unchanged, in the default mode, `auto`: the briefing is the same bytes it was before modes existed and no tool call is ever held. The person may instead choose to be asked before compute is spent (`partial`: every `job_start` call is put to them before it runs) or to run a study in approved stages (`structured`: the `checkpoint` tool puts its summary to them, and `job_start` is held until a checkpoint has been approved; the tool is in the list in every mode, answering outside structured mode that checkpoints are structured mode's, because a session's system prompt and tool list never change mid-conversation and a switch reaches the model as a harness note). The harness then gates exactly what the person asked to have gated and nothing else. This is the same principle as `commands.py`: the user's own words about how they want to be heard, not the harness's opinion about how the model should work. The modes live in `modes.py`, the question and its answer in `approval.py`, and the one place a call is held is `Loop._consult`.
 
 There is no gate DAG, no state machine, no lock, no watchdog with authority, no budget the model must reason about. If the agent wants to write itself a spec, tests, or a checklist, it can — and nothing verifies that it did.
 
@@ -120,6 +122,8 @@ class Backend(Protocol):
 
 Instance acquisition: the CLI creates (or reuses, `--instance`) an instance at session start; lazy-start on a stopped instance is the backend's problem, invisible above the protocol.
 
+The session does not wait for the instance to be up. `hosted.reserve` settles which instance in a fraction of a second and hands back a starter; the start runs on its own thread, and a `PendingBackend` (`backend/pending.py`, transport-free) stands in for the workspace until it is here, so the header goes out, the model is briefed and the person can start talking while the machine boots. Every tool call waits for the real backend the first time something needs it (a `background=True` exec answers `idle` at once, as the protocol says it must). The briefing says the workspace is coming and roughly when (`OPENREYNOLDS_WORKSPACE_ETA_S`), and that the case itself needs no machine to talk about; a note follows into the thread when it is up, with the directory listing and core count the briefing could not wait for. `acquire` remains as `reserve` plus the wait, for the read-only commands.
+
 ---
 
 ## 4. Tool surface (deliberately few)
@@ -133,8 +137,10 @@ Instance acquisition: the CLI creates (or reuses, `--instance`) an instance at s
 | `job_check` | `(job_id, log_offset?)` | status + incremental log tail in one call (cheap to use repeatedly) |
 | `job_kill` | `(job_id)` | |
 | `fetch` | `(paths[])` | pull files to the local mirror `./studies/<id>/`, print local paths, register as platform artifacts |
+| `cad` | `(request, case?, geometry?, inputs[]?)` | a shape in words -- or a `.step`/`.iges` already on the workspace, plus any files to work from -- handed to the CAD desk (`cad/`), a second agent that builds, meshes and checks it on the same workspace, one python cell a step in a kernel there; the call holds until the desk is finished; offered when the desk is configured |
+| `checkpoint` | `(stage, summary, next)` | **structured mode's**: puts the summary and what comes next in front of the person and waits for their answer (§1); in the list in every mode, and outside structured mode it answers that it is structured mode's and puts nothing to anyone |
 
-That is the entire surface. No `run_gate`, no `amend_spec`, no `ask_user` tool — asking is just talking; this is a chat. Meshing, checking, rendering, post-processing are all `bash`.
+That is the entire surface. No `run_gate`, no `amend_spec`, no `ask_user` tool — asking is just talking; this is a chat. Meshing, checking, rendering, post-processing are all `bash` or `cad`. `checkpoint` is not an exception to that: it does something only when the person chose to approve a study in stages, and then it is their gate, not the harness's. It is in the list in every mode, because the list may not change mid-conversation.
 
 ---
 
@@ -168,10 +174,13 @@ What exists today:
 
 - **Bring your own key** (the default, and the only mode for a self-hosted agent). The
   agent calls your provider directly with your key. The workspace service never sees it.
-- **The metered provider** (`OPENREYNOLDS_PROVIDER=reynolds`). The agent calls
-  `{service}/v1/llm` with its *workspace* key as the model key; the service swaps in the
-  platform's own credential, relays the request including streaming, and meters the
-  tokens into the same monthly budget as compute. No model key of your own.
+- **The metered provider** (`OPENREYNOLDS_PROVIDER=reynolds`). The agent speaks the
+  OpenAI Responses API to `{service}/v1/llm/v1` for GPT, or Anthropic's Messages API to
+  `{service}/v1/llm` for Claude -- the model picks which -- with its *workspace* key as
+  the model key; the service swaps in the platform's own credential (Azure for GPT,
+  Bedrock for Claude, which the agent neither knows nor needs to), relays the request
+  including streaming, and meters the tokens into the same monthly budget as compute.
+  No model key of your own.
 
 Neither is privileged in the code. `llm/presets.py` carries both, and `make_provider`
 cannot tell which it has.
@@ -207,6 +216,8 @@ Closing the laptop is fine — jobs live on the instance. `openreynolds --study 
 
 `./studies/<id>/` on the user's machine holds session metadata (instance id, study id, message log) and everything `fetch`ed (renders, reports). Working state lives in `/work` on the instance in whatever layout the agent chose. `openreynolds studies` lists local sessions.
 
+The live mirror (`mirror.py`) lists the study's directory every cycle and on the way out of a session. A foreground listing is asked as a poll first, and when the poll finds nothing running it is read from the service's copy of the workspace (`Backend.list_stored`; the hosted backend reads it under `Backend.study_id`, which the session sets when it opens or resumes the study's row) -- so ending a session whose workspace has already been stopped does not start a machine to list it. Only a backend with no copy to read starts one.
+
 ---
 
 ## 10. Capture plumbing (invisible to the model)
@@ -233,6 +244,10 @@ This is the platform-value capture that makes the closed pieces worth building, 
 | `openreynolds config` | set `FOAMD_API_KEY`, `ANTHROPIC_API_KEY`, base URL, model, the two levels |
 | `--ambition sketch\|standard\|thorough` | how much work this study is worth |
 | `--consent early\|costly\|never` | when to come back and ask |
+| `openreynolds --mode <auto\|partial\|structured>` | how much the person is consulted (§1, `docs/modes.md`); refused with `-p` unless `auto` |
+| `openreynolds --effort <low\|medium\|high>` | reasoning effort for the session |
+
+**In a session.** Typed lines are messages, except the verbs in `commands.COMMANDS`, which is the one registry the parser, `/help`, the interface's Tab completion and the hosted composer's suggestion list are read from: `/btw`, `/status`, `/level`, `/files`, `/renders`, `/open`, `/mode`, `/model`, `/effort`, `/yes`, `/no`, `/all`, `/help [topic]`, `/exit` (`docs/session-commands.md`). `/model` and `/effort` change the model mid-study; a model switch is probed before it is accepted and applied only between turns (`switch.py`, `docs/switching-models.md`).
 
 Fetched PNGs print their local paths; inline terminal image display (iTerm2/kitty protocols) is an A5 nicety.
 

@@ -107,6 +107,36 @@ def test_control_dict_gives_the_bounds_and_ignores_comments():
     assert found["writeInterval"] == 0.05
 
 
+def test_a_function_object_s_write_interval_is_not_the_run_s():
+    """A live case's top level said writeInterval 0.02 and its `forces` function object
+    said writeInterval 5; read flat, the last one won and the launch note announced
+    "writeInterval 5 (0 write times)". Only depth-zero entries are the run's."""
+    text = CONTROL_DICT.replace("writeInterval   0.05;", "writeInterval   0.02;") + """
+functions
+{
+    forces
+    {
+        type            forces;
+        writeControl    timeStep;
+        writeInterval   5;
+        patches         (text);
+    }
+}
+"""
+    found = parse_control_dict(text)
+    assert found["writeInterval"] == 0.02
+    assert found["endTime"] == 6.0
+
+
+def test_start_from_and_purge_write_are_read_for_the_restart_guard():
+    assert parse_control_dict(CONTROL_DICT)["startFrom"] == "startTime"
+    text = CONTROL_DICT.replace("startFrom       startTime;", "startFrom       latestTime;") + "purgeWrite      3;\n"
+    found = parse_control_dict(text)
+    assert found["startFrom"] == "latestTime"
+    assert found["purgeWrite"] == 3
+    assert "purgeWrite" not in parse_control_dict(CONTROL_DICT)
+
+
 def test_a_stop_at_that_is_not_end_time_means_no_end():
     text = CONTROL_DICT.replace("stopAt          endTime;", "stopAt writeNow;")
     found = parse_control_dict(text)
@@ -474,3 +504,29 @@ def test_the_bar_shows_for_real_work_and_hides_otherwise():
     assert not _bar_worth_showing(Progress("thinking", "thinking · 12 s", "", None, True, 1))
     assert not _bar_worth_showing(Progress("writing", "writing · 3 s", "", None, True, 1))
     assert not _bar_worth_showing(Progress("waiting", "waiting for you", "", None, False, 1))
+
+
+def test_the_now_line_comes_from_the_tracker_with_no_model_and_no_clock():
+    """The front desk wrote this line with a model call every couple of minutes. It is
+    the bar's own knowledge in words now, said when it changes and not every second."""
+    from openreynolds.progress import Tracker
+
+    told = []
+
+    class View:
+        def progress(self, snapshot):
+            pass
+
+        def narration(self, text):
+            told.append(text)
+
+    tracker = Tracker(View())
+    tracker.begin("thinking")
+    tracker.push()
+    tracker.push()
+    tracker.begin("tool", "bash", cmd="blockMesh")
+    tracker.idle()
+    tracker.begin("writing")
+
+    # Idle takes the line back: a view holds what it was told (#48 on the web app).
+    assert told == ["thinking", "running bash: blockMesh", "", "writing"]

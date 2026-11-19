@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import functools
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -8,6 +10,7 @@ import anthropic
 import pytest
 from rich.console import Console
 
+from openreynolds import images
 from openreynolds.backend.base import (
     WORKSPACE_ROOT,
     Backend,
@@ -17,8 +20,40 @@ from openreynolds.backend.base import (
     Stat,
 )
 from openreynolds.store import Store
-from openreynolds.tools import ToolContext
+from openreynolds.tools import CORES_PROBE, ToolContext
 from openreynolds.view import View
+
+
+def pytest_configure(config):
+    """Windows terminals report 80 columns; pytest then folds workspace paths
+    in the middle of a token and assertions on `str(files_dir)` fail even when
+    the command did the right thing."""
+    del config
+    os.environ["COLUMNS"] = "200"
+
+
+@functools.lru_cache(maxsize=1)
+def a_kernel_can_come_up() -> bool:
+    """Whether a real kernel can start in a `LocalBackend` workspace on this machine.
+
+    The precondition of every test that starts one. A kernel comes up as
+    `python3 .kernel/<id>/driver.py` run through `bash -lc` (`backend/kernel.py`), so
+    that is what is asked -- rather than the platform, which answers wrongly in both
+    directions. On Windows it is two different "no"s: a CI runner's `bash` is WSL's stub
+    ("Windows Subsystem for Linux has no installed distributions"), and a developer box
+    with Git Bash has the shell but answers `python3` with the Microsoft Store alias.
+    """
+    try:
+        done = subprocess.run(["bash", "-lc", "python3 -c 'print(1)'"],
+                              capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.returncode == 0 and done.stdout.strip() == b"1"
+
+
+needs_a_kernel = pytest.mark.skipif(
+    not a_kernel_can_come_up(),
+    reason="no `bash -lc python3` here, so no kernel can come up in a workspace")
 
 
 class FakeBackend(Backend):
@@ -33,6 +68,9 @@ class FakeBackend(Backend):
         self.exec_results: dict[str, ExecResult] = {
             # So the briefing's imperative guards see the line that depends on it.
             "nproc": ExecResult(0, "8\n", False, None),
+            # The probe the machine note and the launch note ask: threads, then physical
+            # cores. Eight and four is a c7i.2xlarge, the production default shape.
+            CORES_PROBE: ExecResult(0, "8\n4\n", False, None),
         }
         self.execs: list[str] = []
         self.exec_background: list[bool] = []
@@ -42,7 +80,10 @@ class FakeBackend(Backend):
         self.logs: dict[str, bytes] = {}
         self.started: list[dict] = []
         self.trees: list[tuple[Path, str]] = []
+        self.stat_kwargs: dict = {}
+        self.get_file_kwargs: dict = {}
         self.fetched: list[str] = []
+        self.get_tree_calls: list[dict] = []
 
     def exec(self, cmd, cwd=None, timeout_s=120, *, background=False):
         self.last_exec = (cmd, cwd, timeout_s)
@@ -53,13 +94,17 @@ class FakeBackend(Backend):
     def put_file(self, path, data):
         self.files[path] = data
 
-    def get_file(self, path, offset=0, limit=None):
+    def get_file(self, path, offset=0, limit=None, *, timeout=300.0, max_attempts=None):
+        self.get_file_kwargs = {"timeout": timeout, "max_attempts": max_attempts}
+        del timeout, max_attempts  # no network here to bound; see HostedBackend.get_file
         if path not in self.files:
             raise BackendError(f"no such path: {path}", code="not_found", status=404)
         data = self.files[path][offset:]
         return data[:limit] if limit is not None else data
 
-    def stat(self, path):
+    def stat(self, path, *, timeout=300.0, max_attempts=None):
+        self.stat_kwargs = {"timeout": timeout, "max_attempts": max_attempts}
+        del timeout, max_attempts
         if path in self.dirs:
             return Stat(path, "directory", 0, 0, self.dirs[path])
         if path not in self.files:
@@ -69,9 +114,16 @@ class FakeBackend(Backend):
     def put_tree(self, local_dir, remote_dir):
         self.trees.append((local_dir, remote_dir))
 
-    def get_tree(self, remote_paths, local_dir):
+    def get_tree(self, remote_paths, local_dir, *, timeout=300.0, max_attempts=None, via=None):
         """Mirrors the service: archive members are relative to the workspace root,
-        so a fetched file keeps the shape it had in the workspace."""
+        so a fetched file keeps the shape it had in the workspace.
+
+        `timeout`/`max_attempts`/`via` are accepted and ignored, the same as the
+        local backend -- there is no network here to bound or route around. A test
+        that cares which values the mirror passed reads `self.get_tree_calls`
+        instead of overriding this."""
+        self.get_tree_calls.append({"paths": list(remote_paths), "timeout": timeout,
+                                     "max_attempts": max_attempts, "via": via})
         self.fetched.extend(remote_paths)
         written = []
         for remote in remote_paths:
@@ -110,6 +162,139 @@ class FakeBackend(Backend):
 
     def close(self):
         pass
+
+
+class ReadyStarter:
+    """Stands in for `hosted.Starter`: a workspace that is up the moment it is asked.
+
+    `reserve` hands one back; the session kicks it and `_bring_up` collects the
+    backend from `result()`. With `error` set, the start fails the way a start against
+    a service that is down fails -- with a `BackendError` -- once anything asks.
+    `hold` is an event the start waits on, for a test that needs the workspace to be
+    still coming up while it looks."""
+
+    def __init__(self, backend, instance_id="iid-1", *, instances_held=0,
+                 listed_as_running=False, error=None, hold=None):
+        self.backend = backend
+        self.instance_id = instance_id
+        self.instances_held = instances_held
+        self.listed_as_running = listed_as_running
+        self.error = error
+        self.hold = hold
+        self.started = False
+        self.cancelled = False
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        if self.started:
+            return False
+        self.cancelled = True
+        return True
+
+    @property
+    def done(self):
+        return self.hold is None or self.hold.is_set()
+
+    @property
+    def elapsed_s(self):
+        return 0.0
+
+    def result(self, timeout=None):
+        self.start()
+        if self.hold is not None:
+            self.hold.wait(timeout)
+        if self.error is not None:
+            raise self.error
+        return self.backend
+
+    def pending(self, **kwargs):
+        from openreynolds.backend.pending import PendingBackend
+
+        return PendingBackend(
+            self.instance_id, instances_held=self.instances_held,
+            was_already_running=self.listed_as_running, **kwargs,
+        )
+
+
+def reserved(backend, instance_id="iid-1", **kwargs):
+    """`monkeypatch.setattr(cli.hosted, "reserve", reserved(backend))`: the seam a
+    session gets its workspace through, answered from memory. Returns what `reserve`
+    returns -- no client, the instance id, a starter that resolves to `backend`."""
+
+    def reserve(url, key, iid=None, **_kw):
+        return None, instance_id, ReadyStarter(backend, instance_id, **kwargs)
+
+    return reserve
+
+
+def refusing_to_reserve(error=None):
+    """A `reserve` against a service that is not there, for the tests that turn on
+    what a session settles before it has a workspace."""
+
+    def reserve(url, key, iid=None, **_kw):
+        raise error or BackendError("no service in this test")
+
+    return reserve
+
+
+@pytest.fixture(autouse=True)
+def an_openfoam_study_unless_told(monkeypatch, request):
+    """A session with no solver given leaves it to the agent (`--solver auto`), which
+    reserves no workspace until the model has chosen. The suite's sessions are about
+    everything else, written against an OpenFOAM study whose workspace is reserved at
+    the start, so that is the solver they get -- through the same environment variable
+    an embedder sets. `tests/test_felix_mode.py` clears it where the choice is the
+    subject."""
+    monkeypatch.setenv("OPENREYNOLDS_SOLVER", "openfoam")
+    # A resume of a study this machine has never held asks the platform for its
+    # solver before reserving. No test has a platform behind that question, so the
+    # answer is "no such study", which leaves the solver to the record and the flag.
+    # The Felix tests answer it themselves, and test the real question.
+    if request.node.module.__name__ != "test_felix_mode":
+        monkeypatch.setattr("openreynolds.backend.hosted.study_solver",
+                            lambda *args, **kwargs: (None, True), raising=False)
+
+
+@pytest.fixture(autouse=True)
+def nothing_is_shared(monkeypatch, tmp_path_factory):
+    """A session that reaches the close-down would queue its trace and send it, from
+    whatever machine the suite runs on, as whoever that machine is signed in as. No test
+    may do that: sharing is off, and its files are a temporary folder's, for every test.
+    `tests/test_sharing.py` turns it back on where sharing is the subject."""
+    from openreynolds import sharing
+
+    folder = tmp_path_factory.mktemp("sharing")
+    monkeypatch.setenv("OPENREYNOLDS_SHARING", "off")
+    monkeypatch.setattr(sharing, "state_path", lambda: folder / "sharing.json")
+    monkeypatch.setattr(sharing, "queue_dir", lambda: folder / "queue")
+
+
+@pytest.fixture(autouse=True)
+def retry_waits_are_instant(monkeypatch):
+    """A transient model failure is retried after a wait of seconds to minutes
+    (`llm.base.TRANSIENT_WAITS`). The suite's failures are scripted, so the waits are
+    skipped -- the `stop` question is still asked once, as a real wait would ask it."""
+    from openreynolds.llm import base
+
+    monkeypatch.setattr(base, "nap", lambda seconds, stop=lambda: False: not stop())
+
+
+@pytest.fixture(autouse=True)
+def drawing_starts_allowed():
+    """`--output-format stream-json` gives up drawing inline images for the life of
+    the process, because a pseudo-terminal answers `isatty()` the same way a person's
+    terminal does and the escape payload would land in the middle of the NDJSON.
+
+    A process runs in one output mode for its whole life; a test process runs many
+    sessions in one interpreter, so the flag is reset around each one. Without this
+    the first test to ask for stream-json would quietly turn every later drawing test
+    into a test of nothing.
+    """
+    images.allow_drawing()
+    yield
+    images.allow_drawing()
 
 
 @pytest.fixture
@@ -254,6 +439,15 @@ class RecordingView(View):
         self.progresses = []
         self.narrations = []
         self.desk_replies = []
+        self.side_questions = []
+        self.side_answers = []
+        self.receipts = []
+        self.working_on = []
+        self.whose = None
+        """Whose move a hosted page would show, from the calls that set it there
+        (`WebView`): the person's at a prompt, the agent's from `working` or the first
+        streamed thought."""
+        self.solvers = []
         self.deliveries = []
         self.rendered = []
         self.browser = None
@@ -262,6 +456,7 @@ class RecordingView(View):
         self.headers.append((study_id, instance_id, model, mirror))
 
     def thinking_begin(self):
+        self.whose = "agent"
         self.thinking.append("<begin>")
 
     def thinking_delta(self, text):
@@ -325,6 +520,7 @@ class RecordingView(View):
         self.mirrors.append(report)
 
     def prompt(self):
+        self.whose = "user"
         self.prompts += 1
 
     def progress(self, snapshot):
@@ -335,6 +531,22 @@ class RecordingView(View):
 
     def desk(self, text):
         self.desk_replies.append(text)
+
+    def side_question(self, text):
+        self.side_questions.append(text)
+
+    def side_answer(self, text, forwarded):
+        self.side_answers.append((text, forwarded))
+
+    def received(self, text):
+        self.receipts.append(text)
+
+    def working(self, what):
+        self.whose = "agent"
+        self.working_on.append(what)
+
+    def solver(self, name):
+        self.solvers.append(name)
 
     @property
     def said(self) -> str:

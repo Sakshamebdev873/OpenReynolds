@@ -8,10 +8,19 @@ going. Everything here exists because of that.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
+from shellprobe import Machine, Process
 from openreynolds.backend.base import BackendError, ExecResult, JobStatus
-from openreynolds.stopping import StopReport, running_solvers, stop_everything
+from openreynolds.stopping import (
+    StopReport,
+    own_solvers,
+    running_solvers,
+    settle_after_shutdown,
+    stop_everything,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -67,6 +76,66 @@ def test_it_stops_every_job_and_records_them_stopped(backend, store):
     assert report.clean
     assert store.live_jobs() == []
     assert all(j.end_reason == "killed_by_client" for j in store.session.jobs.values())
+
+
+def test_a_job_that_had_already_crashed_keeps_its_ending_rather_than_reading_stopped(
+    backend, store
+):
+    """The service answers a kill on an ended job with the job's real ending; writing
+    `killed_by_client` over it showed a crash as a stop, and the report said it was
+    stopped."""
+    with_jobs(backend, store, "solve")
+    processes(backend)
+    (job_id,) = store.session.jobs
+    backend.jobs[job_id] = JobStatus(job_id=job_id, status="exited", name="solve",
+                                     exit_code=1, end_reason="failed")
+    backend.job_kill = lambda jid, signal="TERM": backend.jobs[jid]
+
+    report = stop_everything(backend, store)
+
+    record = store.session.jobs[job_id]
+    assert (record.status, record.end_reason) == ("exited", "failed")
+    assert report.killed == []
+    assert "solve had already ended (failed)" in report.lines()
+
+
+def test_a_job_that_had_already_ended_is_not_sent_the_escalated_kill(backend, store):
+    """Survivors bring a KILL to the jobs this stop signalled; sending it to one that
+    had already crashed reported the crash as a stop that ignored its first signal."""
+    with_jobs(backend, store, "solve")
+    processes(backend, "simpleFoam")
+    (job_id,) = store.session.jobs
+    backend.jobs[job_id] = JobStatus(job_id=job_id, status="exited", name="solve",
+                                     exit_code=1, end_reason="failed")
+    sent = []
+    backend.job_kill = lambda jid, signal="TERM": sent.append(signal) or backend.jobs[jid]
+
+    report = stop_everything(backend, store)
+
+    assert sent == ["TERM"]
+    assert report.escalated == []
+
+
+@pytest.mark.parametrize("answer", [
+    {"status": "running", "end_reason": None},
+    {"status": "exited", "end_reason": None},
+])
+def test_a_kill_answer_that_names_no_ending_is_recorded_as_the_stop_it_was(
+    backend, store, answer
+):
+    """Still running a moment after TERM, or an answer with no end_reason: the kill was
+    sent, so the record says stopped rather than running or a half-written ending."""
+    with_jobs(backend, store, "solve")
+    processes(backend)
+    (job_id,) = store.session.jobs
+    backend.job_kill = lambda jid, signal="TERM": JobStatus(job_id=jid, name="solve", **answer)
+
+    report = stop_everything(backend, store)
+
+    record = store.session.jobs[job_id]
+    assert (record.status, record.end_reason) == ("killed", "killed_by_client")
+    assert report.killed == ["solve"]
+    assert store.live_jobs() == []
 
 
 def test_nothing_running_is_not_a_failure(backend, store):
@@ -387,3 +456,183 @@ def test_a_study_that_predates_homes_is_treated_as_unscoped(backend, store):
     stop_everything(backend, store, force=True, home="/work")
     assert any(c.startswith("ps ") for c in backend.execs)
     assert not any("/proc" in c for c in backend.execs)
+
+
+# -- the probe against a container shaped the way a real one is ----------------
+
+
+VOLUME = "/__modal/volumes/vo-QLeP1IjwPg9DkyX8ENl2HW"
+"""What `/work` actually is inside a Modal Sandbox: a symlink to the Volume's mount.
+The path is from the production transcript that prints one case both ways --
+`/__modal/volumes/vo-QLeP1IjwPg9DkyX8ENl2HW/onera_hisa` from getcwd (physical, which
+is what `/proc/<pid>/cwd` answers) and `/work/onera_hisa` from `$PWD` (logical, which
+is all a shell `cd` updates)."""
+
+
+def sandbox(backend, *processes_, home="/work/study-test"):
+    """Make `backend.exec` RUN the probe against a Sandbox-shaped container.
+
+    Every other test here answers the probe with a canned string, which is how a probe
+    whose `case` patterns matched nothing in production passed every test it had.
+    """
+    machine = Machine(
+        links={"/work": VOLUME},
+        processes=[Process(pid, comm, cwd) for pid, comm, cwd in processes_],
+    )
+
+    def run(cmd, cwd=None, timeout_s=120, *, background=False):
+        backend.execs.append(cmd)
+        if "/proc" in cmd:
+            return ExecResult(0, machine.run(cmd), False, None)
+        return ExecResult(0, "", False, None)
+
+    backend.exec = run
+    return home
+
+
+def test_a_solver_is_found_through_the_symlink_that_work_actually_is(backend, store):
+    """`own_solvers` matched `readlink /proc/<pid>/cwd` against the literal
+    `/work/<study>`, and inside a Sandbox nothing is ever spelled that way -- foamd's
+    own quota check measured `du -sm /work` at 1 MB against `du -sLm /work` at
+    28633 MB on the same live Sandbox, and its jail check resolves the root with
+    `realpath -m` rather than comparing the string. So this answered [] every time it
+    ran in production."""
+    home = sandbox(backend, ("101", "simpleFoam", f"{VOLUME}/study-test/case"))
+
+    assert own_solvers(backend, home) == [("101", "simpleFoam")]
+
+
+def test_an_escaped_mpirun_rank_is_killed_rather_than_reported_as_an_idle_instance(
+    backend, store
+):
+    """The one leak this module exists to catch. With the probe blind, a scoped
+    `stop_everything` reported "nothing was running / the instance is idle" while
+    eight cores kept going -- which is the failure that was first noticed on a bill."""
+    home = sandbox(backend, ("102", "mpirun", f"{VOLUME}/study-test/case"))
+
+    report = stop_everything(backend, store, home=home)
+
+    assert report.survivors == ["mpirun"], "it saw what outlived the job's group"
+    assert not report.clean, "so it does not claim the instance is idle"
+    kills = [c for c in backend.execs if c.startswith("kill -9")]
+    assert kills and "102" in kills[0], "and it killed it, by pid"
+
+
+def test_another_studys_solver_under_the_same_volume_is_still_out_of_reach(backend, store):
+    """Resolving the root must not widen the sweep: every study on the instance lives
+    under the same physical prefix, and a kill that reached them was the 22-minute
+    solve this scoping was written to protect."""
+    home = sandbox(backend, ("103", "simpleFoam", f"{VOLUME}/other-study/case"))
+
+    report = stop_everything(backend, store, home=home)
+
+    assert report.clean
+    assert report.survivors == []
+    assert not any(c.startswith(("pkill", "kill -9")) for c in backend.execs)
+
+
+# The local backend signals a process group (`os.killpg`) and runs jobs under `bash -lc`,
+# both POSIX only; the tests that start a real local job say so rather than failing Windows.
+posix_only = pytest.mark.skipif(
+    os.name != "posix", reason="the local backend runs jobs in a POSIX process group")
+
+
+@pytest.mark.parametrize("script, ending", [
+    ("exit 0", ("exited", "completed")),
+    ("exit 1", ("exited", "failed")),
+    ("exit 137", ("exited", "killed_externally")),
+    ("kill -KILL $$", ("exited", "killed_externally")),
+    ("kill -SEGV $$", ("exited", "failed")),
+])
+@posix_only
+def test_a_local_job_ends_in_the_services_words(tmp_path, script, ending):
+    """A signal death nobody asked for (an OOM kill, a segfault, reported by the
+    `bash -lc` wrapper as 137) used to read as `killed_by_client` or `completed`, and a
+    solver's own error as `completed`."""
+    from openreynolds.backend.local import LocalBackend
+
+    local = LocalBackend(root=tmp_path)
+    job_id = local.job_start(script, name="solve")
+    local._job(job_id).process.wait(timeout=30)
+    status = local.job_status(job_id)
+    assert (status.status, status.end_reason) == ending
+
+
+@posix_only
+def test_a_local_job_stopped_through_job_kill_reads_as_stopped(tmp_path):
+    from openreynolds.backend.local import LocalBackend
+
+    local = LocalBackend(root=tmp_path)
+    job_id = local.job_start("sleep 30", name="solve")
+    try:
+        status = local.job_kill(job_id)
+    finally:
+        local._terminate(local._job(job_id), "KILL")
+    assert (status.status, status.end_reason) == ("killed", "killed_by_client")
+
+
+MACHINE_STOPPED = "machine_stopped: this service ended the workspace's compute on purpose"
+
+
+def _undelivered(backend, store):
+    """A stop whose one kill the service answered `kill_not_delivered`."""
+    with_jobs(backend, store, "solve")
+    processes(backend)
+    (job_id,) = store.session.jobs
+
+    def not_delivered(jid, signal="TERM"):
+        raise BackendError("no process group to signal", code="kill_not_delivered")
+
+    backend.job_kill = not_delivered
+    return job_id, stop_everything(backend, store)
+
+
+@pytest.mark.parametrize("answer, recorded", [
+    ({"status": "killed", "end_reason": "sandbox_expired", "killed_by": MACHINE_STOPPED},
+     ("killed", "killed_by_client")),
+    ({"status": "running"}, ("killed", "killed_by_client")),
+    ({"status": "exited", "end_reason": "failed", "exit_code": 1}, ("exited", "failed")),
+    ({"status": "killed", "end_reason": "sandbox_expired", "killed_by": "container_gone: ..."},
+     ("killed", "sandbox_expired")),
+])
+def test_a_job_the_ended_session_took_down_with_it_is_recorded_as_stopped(
+    backend, store, answer, recorded
+):
+    """A job whose kill was not delivered (still starting) stayed running in the
+    record after End put the workspace down, then read as ending unexpectedly."""
+    job_id, report = _undelivered(backend, store)
+    backend.job_status = lambda jid: JobStatus(job_id=jid, name="solve", **answer)
+
+    stopped = settle_after_shutdown(backend, store, report)
+
+    record = store.session.jobs[job_id]
+    assert (record.status, record.end_reason) == recorded
+    assert stopped == (["solve"] if recorded[1] == "killed_by_client" else [])
+    assert store.live_jobs() == []
+
+
+def test_a_job_that_cannot_be_asked_after_the_end_is_recorded_as_stopped(backend, store):
+    job_id, report = _undelivered(backend, store)
+
+    def refuse(jid):
+        raise BackendError("gone", code="not_found")
+
+    backend.job_status = refuse
+    settle_after_shutdown(backend, store, report)
+    assert store.session.jobs[job_id].end_reason == "killed_by_client"
+
+
+def test_only_a_kill_that_was_not_delivered_is_settled_by_the_shutdown(backend, store):
+    """A kill that failed any other way (a 503, a job a resumed local backend cannot
+    see) is left as the record had it: nothing says the shutdown ended that job."""
+    with_jobs(backend, store, "solve")
+    processes(backend)
+
+    def unavailable(jid, signal="TERM"):
+        raise BackendError("try again", code="http_error")
+
+    backend.job_kill = unavailable
+    report = stop_everything(backend, store)
+
+    assert settle_after_shutdown(backend, store, report) == []
+    assert [r.name for r in store.live_jobs()] == ["solve"]

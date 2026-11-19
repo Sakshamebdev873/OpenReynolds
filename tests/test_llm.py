@@ -10,8 +10,11 @@ import pytest
 
 from openreynolds import llm
 from openreynolds.llm.anthropic_api import AnthropicProvider
-from openreynolds.llm.base import Listener, TextBlock, ToolUseBlock, Turn, neutral_blocks, split_result
+from openreynolds.llm.base import (BadRequest, Listener, ProviderError, TextBlock, ToolUseBlock, Turn,
+                                   neutral_blocks, split_result)
 from openreynolds.llm.openai_api import OpenAIProvider
+from openreynolds.llm.responses_api import ResponsesProvider
+from openreynolds.llm.base import transient
 
 from conftest import FakeMessages, message, text_block, tool_block
 
@@ -82,6 +85,21 @@ def test_make_provider_picks_the_family_and_the_preset_endpoint():
 
     explicit = llm.make_provider(cfg(provider="openai", llm_base_url="https://gateway.example/v1"))
     assert "gateway.example" in str(explicit.client.base_url)
+
+
+def test_a_socks_proxy_does_not_stop_the_model_client_from_starting(monkeypatch):
+    """A machine whose `ALL_PROXY` was a SOCKS URL could not even construct the
+    client: httpx2 honored the proxy, but the installed package had no SOCKS transport.
+    No request is made here; starting the provider is the behaviour that regressed."""
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+                 "http_proxy", "https_proxy", "no_proxy", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("ALL_PROXY", "socks5h://127.0.0.1:9")
+
+    provider = llm.make_provider(cfg())
+
+    assert isinstance(provider, AnthropicProvider)
+    provider.client.close()
 
 
 # -- the Messages API ---------------------------------------------------------------
@@ -173,6 +191,270 @@ def test_anthropic_reports_the_system_role_refusal_for_the_loop_to_fold():
         )
     assert "system" in str(caught.value)
     assert provider.lean is False
+
+
+# -- a safety refusal falls back to the next model ------------------------------------
+
+
+def refusal(model, category="frontier_llm", explanation="This request was blocked"):
+    turn = message([], stop_reason="refusal")
+    turn.model = model
+    turn.stop_details = SimpleNamespace(type="refusal", category=category, explanation=explanation)
+    return turn
+
+
+def served(model, text="the mesh has 94,321 cells"):
+    turn = message([text_block(text)])
+    turn.model = model
+    return turn
+
+
+def ask(provider, model="claude-opus-5"):
+    return provider.stream(
+        model=model, system="s", messages=[{"role": "user", "content": "mesh it"}], tools=[],
+        effort="high", max_tokens=10, listener=Listener(),
+    )
+
+
+def test_a_refusal_is_retried_on_the_fallback_and_the_turn_says_who_answered():
+    """Anthropic's safety classifier answers 200 with `stop_reason: "refusal"`, and its
+    remedy is the same request on another Claude model. Live, 2026-10-01: a CFD study
+    was declined under the "reverse engineering or duplicating model outputs" rule
+    and the session stopped dead."""
+    provider = anthropic_provider([refusal("claude-opus-5"), served("claude-sonnet-5")])
+    provider.fallbacks = ("claude-sonnet-5", "claude-opus-5")
+
+    turn = ask(provider)
+
+    assert turn.stop_reason == "end_turn" and turn.text == "the mesh has 94,321 cells"
+    assert turn.model == "claude-sonnet-5"
+    assert turn.declined == [("claude-opus-5", "frontier_llm: This request was blocked")]
+    asked = [c["model"] for c in provider.client.messages.calls]
+    assert asked == ["claude-opus-5", "claude-sonnet-5"]
+    assert "claude-opus-5 (frontier_llm: This request was blocked) declined" in llm.refusal_line(turn)
+    assert "claude-sonnet-5 answered" in llm.refusal_line(turn)
+
+
+def test_the_model_that_answered_is_pinned_for_the_rest_of_the_provider():
+    """A refusal before any output is billed in some categories, and a desk running
+    its own thirty-step loop on the model that just declined would pay for thirty of
+    them. The vendor's advice is to stay on the model that accepted."""
+    provider = anthropic_provider(
+        [refusal("claude-opus-5"), served("claude-sonnet-5"), served("claude-sonnet-5", "and still is")]
+    )
+    provider.fallbacks = ("claude-sonnet-5",)
+
+    ask(provider)
+    again = ask(provider)
+
+    assert again.model == "claude-sonnet-5" and again.declined == []
+    asked = [c["model"] for c in provider.client.messages.calls]
+    assert asked == ["claude-opus-5", "claude-sonnet-5", "claude-sonnet-5"]
+    assert provider.pinned == {"claude-opus-5": "claude-sonnet-5"}
+
+
+def test_when_every_model_declines_the_last_refusal_comes_back_naming_the_others():
+    provider = anthropic_provider(
+        [refusal("claude-opus-5"), refusal("claude-sonnet-5", "general_harms", "declined")]
+    )
+    provider.fallbacks = ("claude-sonnet-5",)
+
+    turn = ask(provider)
+
+    assert turn.stop_reason == "refusal" and turn.model == "claude-sonnet-5"
+    assert turn.declined == [("claude-opus-5", "frontier_llm: This request was blocked")]
+    assert provider.pinned == {}
+    line = llm.refusal_line(turn)
+    assert line.startswith("Every model declined")
+    assert "claude-opus-5" in line and "claude-sonnet-5 (general_harms: declined)" in line
+
+
+def test_without_a_chain_a_refusal_is_final_and_reads_as_it_always_did():
+    provider = anthropic_provider([refusal("claude-opus-5")])
+    assert provider.fallbacks == ()
+
+    turn = ask(provider)
+
+    assert turn.stop_reason == "refusal" and turn.declined == []
+    assert len(provider.client.messages.calls) == 1
+    assert llm.refusal_line(turn) == (
+        "The model declined this request: frontier_llm: This request was blocked"
+    )
+
+
+def test_the_requested_model_is_never_its_own_fallback():
+    provider = anthropic_provider([refusal("claude-opus-5")])
+    provider.fallbacks = ("claude-opus-5",)
+    assert provider.chain("claude-opus-5") == ["claude-opus-5"]
+    ask(provider)
+    assert len(provider.client.messages.calls) == 1
+
+
+def test_complete_falls_back_too():
+    """The front desk's one-shot call is a request path as well."""
+    class Creating:
+        def __init__(self, answers):
+            self.answers = list(answers)
+            self.calls = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return self.answers.pop(0)
+
+    provider = AnthropicProvider("k")
+    provider.client = SimpleNamespace(messages=Creating([refusal("claude-haiku-4-5"), served("claude-sonnet-5", " fine ")]))
+    provider.fallbacks = ("claude-sonnet-5",)
+
+    assert provider.complete(model="claude-haiku-4-5", system="s", prompt="p", max_tokens=5) == "fine"
+    assert [c["model"] for c in provider.client.messages.calls] == ["claude-haiku-4-5", "claude-sonnet-5"]
+
+
+def test_make_provider_hands_every_adapter_the_chain_for_its_configuration():
+    reynolds = llm.make_provider(cfg(provider="reynolds", llm_api_key="", foamd_url="https://api.example", foamd_api_key="k"))
+    assert reynolds.fallbacks == ("gpt-6.1-sol", "gpt-6-astra")
+    assert reynolds.chain("gpt-6-astra") == ["gpt-6-astra", "gpt-6.1-sol"]
+    assert reynolds.chain("gpt-6.1-sol") == ["gpt-6.1-sol", "gpt-6-astra"]
+    assert "gpt-6-luna" not in reynolds.fallbacks
+
+    # The desk model is not a fallback for a study: its window would not hold the thread.
+    assert llm.make_provider(cfg()).fallbacks == ("claude-opus-5", "claude-sonnet-5")
+    assert "claude-haiku-4-5" not in llm.make_provider(cfg()).fallbacks
+
+    # A vendor we know one model id for gets no guessed second one.
+    assert llm.make_provider(cfg(provider="zai")).fallbacks == ()
+    assert llm.make_provider(cfg(provider="openai")).fallbacks == ()
+
+    # The configuration overrides the preset, and can switch the chain off.
+    named = llm.make_provider(cfg(fallback_models=" claude-sonnet-5 ,claude-haiku-4-5"))
+    assert named.fallbacks == ("claude-sonnet-5", "claude-haiku-4-5")
+    assert llm.make_provider(cfg(fallback_models="off")).fallbacks == ()
+    assert llm.make_provider(cfg(fallback_models="0")).fallbacks == ()
+
+
+def _reynolds(**kw):
+    return cfg(provider="reynolds", llm_api_key="sk-ant-left-over",
+               llm_base_url="https://elsewhere.example", foamd_url="https://api.example/",
+               foamd_api_key="of_live_k", **kw)
+
+
+@pytest.mark.parametrize("model, adapter, route", [
+    ("gpt-6.1-sol", ResponsesProvider, "https://api.example/v1/llm/v1"),
+    ("gpt-6-astra", ResponsesProvider, "https://api.example/v1/llm/v1"),
+    ("gpt-6-luna", ResponsesProvider, "https://api.example/v1/llm/v1"),
+    ("claude-sonnet-5-5", AnthropicProvider, "https://api.example/v1/llm"),
+    ("claude-opus-5-5", AnthropicProvider, "https://api.example/v1/llm"),
+    ("claude-haiku-4-5", AnthropicProvider, "https://api.example/v1/llm"),
+])
+def test_reynolds_picks_the_api_by_the_model_not_the_preset(model, adapter, route):
+    """The service routes Claude over the Messages API at `/v1/llm` (the Anthropic
+    client appends `/v1/messages`) and GPT over the Responses API at `/v1/llm/v1`,
+    both on the service key and never on a model key left in the config."""
+    for p in (llm.make_provider(_reynolds(model=model)),
+              llm.make_provider(_reynolds(model="gpt-6.1-sol"), model=model)):
+        assert isinstance(p, adapter)
+        assert str(p.client.base_url).rstrip("/") == route
+        assert p.client.api_key == "of_live_k"
+
+
+def test_reynolds_falls_back_within_the_family_and_never_across():
+    gpt = llm.make_provider(_reynolds(model="gpt-6.1-sol"))
+    assert gpt.fallbacks == ("gpt-6.1-sol", "gpt-6-astra")
+    assert gpt.chain("gpt-6.1-sol") == ["gpt-6.1-sol", "gpt-6-astra"]
+    claude = llm.make_provider(_reynolds(model="claude-opus-5-5"))
+    assert claude.fallbacks == ("claude-sonnet-5-5", "claude-opus-5-5")
+    assert claude.chain("claude-opus-5-5") == ["claude-opus-5-5", "claude-sonnet-5-5"]
+    assert claude.chain("claude-sonnet-5-5") == ["claude-sonnet-5-5", "claude-opus-5-5"]
+    # The desk's provider is built for the desk model, and falls within its family too.
+    desk = llm.make_provider(_reynolds(model="claude-opus-5-5"), model="claude-haiku-4-5")
+    assert all(m.startswith("claude-") for m in desk.fallbacks)
+    # A named chain naming both families keeps the half this provider can send.
+    mixed = llm.make_provider(_reynolds(model="claude-sonnet-5-5",
+                                        fallback_models="gpt-6-astra,claude-opus-5-5"))
+    assert mixed.fallbacks == ("claude-opus-5-5",)
+
+
+# -- the Claude 5.5 request shape ----------------------------------------------------
+
+
+class _Creating:
+    def __init__(self, answer):
+        self.answer = answer
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.answer
+
+
+REFUSED_FIELDS = ("temperature", "top_p", "top_k", "tool_choice")
+
+
+@pytest.mark.parametrize("model", ["claude-opus-5-5", "claude-sonnet-5-5"])
+@pytest.mark.parametrize("effort", ["low", "medium", "high"])
+def test_a_claude_5_5_turn_never_disables_thinking_or_forces_a_tool(model, effort):
+    """Opus 5.5 400s on `thinking: disabled` or a budget at every effort, Sonnet 5.5 on
+    `disabled`; both on forced `tool_choice` and on non-default sampling. Opus 5.5
+    defaults to `medium`, so the effort is always sent."""
+    provider = anthropic_provider([message([text_block("ok")])])
+    provider.stream(model=model, system="s", messages=thread(),
+                    tools=[{"name": "bash", "input_schema": {"type": "object"}}],
+                    effort=effort, max_tokens=64_000, listener=Listener())
+    sent = provider.client.messages.calls[0]
+    assert sent["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert sent["output_config"] == {"effort": effort}
+    assert not any(k in sent for k in REFUSED_FIELDS)
+    assert sent["messages"][-1]["role"] != "assistant"
+
+
+def test_a_lean_claude_5_5_turn_still_names_its_effort():
+    provider = anthropic_provider([message([text_block("ok")])])
+    provider.lean = True
+    provider.stream(model="claude-opus-5-5", system="s", messages=thread(), tools=[],
+                    effort="high", max_tokens=10, listener=Listener())
+    sent = provider.client.messages.calls[0]
+    assert sent["output_config"] == {"effort": "high"} and "thinking" not in sent
+    # An older model on a picky endpoint is still asked for nothing extra.
+    older = anthropic_provider([message([text_block("ok")])])
+    older.lean = True
+    older.stream(model="glm-4.6", system="s", messages=thread(), tools=[],
+                 effort="high", max_tokens=10, listener=Listener())
+    assert "output_config" not in older.client.messages.calls[0]
+
+
+@pytest.mark.parametrize("model, thinking, floor", [
+    ("claude-opus-5-5", None, 2_048),
+    ("claude-sonnet-5-5", {"type": "between_tools"}, 60),
+])
+def test_a_claude_5_5_short_answer_asks_for_little_thinking(model, thinking, floor):
+    """The front desk's line (and a fallback for it) is tool-less and short. Opus 5.5
+    cannot stop thinking, so it is asked for the least and given room for it; Sonnet
+    5.5 turns it off with `between_tools`, which takes no other field."""
+    provider = AnthropicProvider("k")
+    provider.client = SimpleNamespace(messages=_Creating(served(model, " busy ")))
+    assert provider.complete(model=model, system="s", prompt="p", max_tokens=60) == "busy"
+    sent = provider.client.messages.calls[0]
+    assert sent["output_config"] == {"effort": "low"}
+    assert sent.get("thinking") == thinking
+    assert sent["max_tokens"] == floor
+    assert not any(k in sent for k in REFUSED_FIELDS)
+
+
+def test_haiku_at_the_desk_is_asked_exactly_as_before():
+    provider = AnthropicProvider("k")
+    provider.client = SimpleNamespace(messages=_Creating(served("claude-haiku-4-5", "ok")))
+    provider.complete(model="claude-haiku-4-5", system="s", prompt="p", max_tokens=60)
+    sent = provider.client.messages.calls[0]
+    assert sent["max_tokens"] == 60
+    assert "thinking" not in sent and "output_config" not in sent
+
+
+def test_openai_content_filter_walks_the_chain_too():
+    provider = openai_provider([[chunk(finish="content_filter")], [chunk(content="ok"), chunk(finish="stop")]])
+    provider.fallbacks = ("gpt-5.2",)
+    turn = provider.stream(model="gpt-5", system="s", messages=[{"role": "user", "content": "x"}], tools=[], effort="", max_tokens=1, listener=Listener())
+    assert turn.text == "ok" and turn.model == "gpt-5.2"
+    assert turn.declined == [("gpt-5", "the endpoint's content filter")]
+    assert [c["model"] for c in provider.client.chat.completions.calls] == ["gpt-5", "gpt-5.2"]
 
 
 def test_anthropic_wraps_status_errors():
@@ -382,9 +664,11 @@ def test_openai_wraps_status_errors():
 
 
 def test_the_reynolds_preset_borrows_the_services_address_and_key():
+    """GPT over the Responses API, at the service's prefix: the OpenAI client appends
+    `/responses`, so `/v1/llm/v1` here is `/v1/llm/v1/responses` on the wire."""
     p = llm.make_provider(cfg(provider="reynolds", llm_api_key="", foamd_url="https://api.example/", foamd_api_key="of_live_k"))
-    assert isinstance(p, AnthropicProvider)
-    assert str(p.client.base_url).rstrip("/") == "https://api.example/v1/llm"
+    assert isinstance(p, ResponsesProvider)
+    assert str(p.client.base_url).rstrip("/") == "https://api.example/v1/llm/v1"
     assert p.client.api_key == "of_live_k"
     assert llm.PRESETS["reynolds"].needs_key is False
 
@@ -417,6 +701,29 @@ def test_anthropic_probe_with_vision_sends_an_image_and_reads_the_refusal():
     assert "text-only" in str(refused.value)
 
 
+def test_anthropic_probe_falls_back_to_a_ping_when_counting_is_forbidden():
+    """Bedrock counts on Mantle under its own IAM action; a key without it can still
+    run the model, so the probe pings instead of refusing the key."""
+
+    class Forbidden:
+        def __init__(self):
+            self.created = []
+
+        def count_tokens(self, **kwargs):
+            raise anthropic.PermissionDeniedError(
+                "not authorized to perform: bedrock-mantle:CountTokens",
+                response=SimpleNamespace(status_code=403, headers={}, request=None), body=None)
+
+        def create(self, **kwargs):
+            self.created.append(kwargs)
+            return SimpleNamespace(content=[])
+
+    provider = AnthropicProvider("k")
+    provider.client = SimpleNamespace(messages=Forbidden())
+    assert "answered a ping" in provider.probe("claude-sonnet-5-5", vision=True)
+    assert provider.client.messages.created[0]["model"] == "claude-sonnet-5-5"
+
+
 def test_openai_probe_with_vision_uses_a_data_uri_and_reads_the_refusal():
     seeing = openai_provider([SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])])
     assert "can see images" in seeing.probe("gpt-5", vision=True)
@@ -436,6 +743,363 @@ def test_openai_probe_with_vision_uses_a_data_uri_and_reads_the_refusal():
 def test_a_stray_model_key_never_reaches_the_service_under_reynolds():
     p = llm.make_provider(cfg(provider="reynolds", llm_api_key="sk-ant-left-over", llm_base_url="https://elsewhere.example",
                              foamd_url="https://api.example", foamd_api_key="of_live_k"))
+    assert isinstance(p, ResponsesProvider)
     assert p.client.api_key == "of_live_k"
-    assert str(p.client.base_url).rstrip("/") == "https://api.example/v1/llm"
+    assert str(p.client.base_url).rstrip("/") == "https://api.example/v1/llm/v1"
 
+
+
+# -- the Responses API -----------------------------------------------------------
+#
+# The dialect exists here for one reason: OpenAI refuses function tools beside a
+# reasoning effort on Chat Completions above gpt-5.2. So what these tests guard is the
+# part Chat Completions cannot express -- the reasoning item surviving a tool round.
+
+
+def _item(**kw):
+    """An output item shaped like the SDK's, including the dump `raw` is built from."""
+    data = dict(kw)
+    return SimpleNamespace(model_dump=lambda exclude_none=True: data, **kw)
+
+
+def test_responses_tools_are_flat_not_nested_under_function():
+    assert ResponsesProvider.tools([{"name": "bash", "description": "run", "input_schema": {"type": "object"}}]) == [
+        {"type": "function", "name": "bash", "description": "run", "parameters": {"type": "object"}}
+    ]
+
+
+def test_responses_sends_its_own_output_items_back_carrying_the_reasoning():
+    """The whole point of the adapter. A rebuilt turn is a turn whose encrypted chain of
+    thought was dropped, and the model then re-derives it every tool round."""
+    provider = ResponsesProvider("k")
+    raw = [
+        {"type": "reasoning", "id": "rs_1", "encrypted_content": "gAAAA", "summary": []},
+        {"type": "function_call", "call_id": "c1", "name": "run_cell", "arguments": '{"source": "1"}'},
+    ]
+    rendered = provider.render([{"role": "assistant", "provider": "openai-responses", "raw": raw, "content": []}])
+    assert rendered == raw
+    assert rendered[0]["encrypted_content"] == "gAAAA"
+
+
+def test_responses_rebuilds_another_providers_turn_and_loses_only_the_reasoning():
+    provider = ResponsesProvider("k")
+    rendered = provider.render([
+        {"role": "assistant", "provider": "anthropic",
+         "content": [text_block("thinking about it"), tool_block("run_cell", {"source": "1"}, "c9")]},
+    ])
+    assert rendered[0]["content"][0]["text"] == "thinking about it"
+    assert rendered[1] == {"type": "function_call", "call_id": "c9", "name": "run_cell",
+                           "arguments": '{"source": "1"}'}
+
+
+def test_responses_puts_a_tool_results_image_inside_its_function_call_output():
+    """The picture rides in the output of the call that drew it, not in a user turn
+    after it, which would read as the person speaking."""
+    provider = ResponsesProvider("k")
+    rendered = provider.render([{ "role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "c1",
+         "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAA"}},
+                     {"type": "text", "text": "plot.png — 1x1 image/png"}]},
+        {"type": "tool_result", "tool_use_id": "c2", "content": "meshed"},
+    ]}])
+    assert rendered == [
+        {"type": "function_call_output", "call_id": "c1",
+         "output": [{"type": "input_image", "image_url": "data:image/png;base64,AAA"},
+                    {"type": "input_text", "text": "plot.png — 1x1 image/png"}]},
+        {"type": "function_call_output", "call_id": "c2", "output": "meshed"},
+    ]
+
+
+def test_responses_turn_reads_the_reasoning_summary_and_the_tool_call():
+    provider = ResponsesProvider("k")
+    response = SimpleNamespace(
+        status="completed", incomplete_details=None,
+        output=[
+            _item(type="reasoning", summary=[SimpleNamespace(text="weigh it")], encrypted_content="gAAAA"),
+            _item(type="function_call", call_id="c1", name="run_cell", arguments='{"source": "print(1)"}'),
+        ],
+        usage=SimpleNamespace(input_tokens=100, output_tokens=20,
+                              input_tokens_details=SimpleNamespace(cached_tokens=40)),
+    )
+    turn = provider._turn(response)
+    assert turn.stop_reason == "tool_use"
+    assert [b.thinking for b in turn.content if b.type == "thinking"] == ["weigh it"]
+    assert [(c.name, c.input) for c in turn.tool_calls] == [("run_cell", {"source": "print(1)"})]
+    # Cached input is priced 10x below fresh input, so it is counted apart, and the four
+    # classes still sum to the whole request.
+    assert turn.tokens == {"input": 60, "cache_read": 40, "cache_write": 0, "output": 20}
+    assert turn.context_tokens == 120
+    assert turn.raw[0]["encrypted_content"] == "gAAAA"
+
+
+def test_responses_counts_a_cache_write_apart_from_fresh_input():
+    """GPT-5.6 and later bill a cache write at 1.25x input, so it is its own class --
+    taken out of the uncached remainder, so the four still sum to the request."""
+    from openreynolds.llm.responses_api import _token_classes
+
+    usage = SimpleNamespace(input_tokens=100, output_tokens=20,
+                            input_tokens_details=SimpleNamespace(cached_tokens=40,
+                                                                 cache_write_tokens=50))
+    assert _token_classes(usage) == {"input": 10, "cache_read": 40, "cache_write": 50,
+                                     "output": 20}
+
+
+def test_responses_complete_asks_for_little_reasoning_and_drops_it_when_refused():
+    """The front desk's short answers: `max_output_tokens` counts the reasoning, so at a
+    default effort a sixty-token line is spent thinking and arrives empty."""
+    provider = ResponsesProvider("k")
+    sent = []
+
+    def create(**kwargs):
+        sent.append(kwargs)
+        if len(sent) == 1:
+            raise openai.BadRequestError(
+                "reasoning is not supported",
+                response=SimpleNamespace(status_code=400, headers={}, request=None),
+                body={"error": {"message": "reasoning.effort is not supported"}})
+        return SimpleNamespace(output_text=" busy meshing ")
+
+    provider.client = SimpleNamespace(responses=SimpleNamespace(create=create))
+    assert provider.complete(model="gpt-6-luna", system="s", prompt="p", max_tokens=60) == "busy meshing"
+    assert sent[0]["reasoning"] == {"effort": "low"}
+    assert "reasoning" not in sent[1]
+    assert provider.lean
+
+
+def test_responses_running_out_of_room_is_max_tokens_not_end_turn():
+    provider = ResponsesProvider("k")
+    response = SimpleNamespace(
+        status="incomplete", incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+        output=[_item(type="message", content=[SimpleNamespace(type="output_text", text="half a th")])],
+        usage=None)
+    turn = provider._turn(response)
+    assert turn.stop_reason == "max_tokens"
+    assert turn.text == "half a th"
+
+
+def test_responses_invalid_tool_arguments_reach_the_handler_as_a_marker():
+    provider = ResponsesProvider("k")
+    response = SimpleNamespace(status="completed", incomplete_details=None, usage=None,
+        output=[_item(type="function_call", call_id="c", name="run_cell", arguments="{not json")])
+    assert provider._turn(response).tool_calls[0].input == {"__invalid_json__": "{not json"}
+
+
+def test_responses_asks_for_the_encrypted_reasoning_and_stores_nothing():
+    provider = ResponsesProvider("k")
+    kwargs = provider._kwargs("m", "sys", [], [{"name": "run_cell", "input_schema": {}}], "medium", 500)
+    assert kwargs["reasoning"] == {"effort": "medium", "summary": "auto"}
+    assert kwargs["include"] == ["reasoning.encrypted_content"]
+    assert kwargs["store"] is False
+    assert kwargs["instructions"] == "sys"
+    # Below the API's own floor is a 400 about the wrong thing.
+    assert provider._kwargs("m", "s", [], [], "", 1)["max_output_tokens"] == 16
+
+
+def test_responses_drops_the_extras_it_is_refused_and_remembers():
+    provider = ResponsesProvider("k")
+    provider.plain = True
+    assert "include" not in provider._kwargs("m", "s", [], [], "medium", 500)
+    provider.lean = True
+    assert "reasoning" not in provider._kwargs("m", "s", [], [], "medium", 500)
+
+
+def test_a_model_served_by_two_vendors_is_priced_by_vendor():
+    """kimi-k3 is 20% dearer at Moonshot than at Aster, so the model id alone cannot
+    price a run. An unqualified id has no price at all rather than a plausible wrong
+    one -- `cad_buildup` refuses to start on `None`, and that refusal is the point."""
+    from openreynolds.llm.presets import prices, spend
+
+    assert prices("kimi-k3", "aster")["output"] == 12.50
+    assert prices("kimi-k3", "moonshot")["output"] == 15.00
+    assert prices("kimi-k3") is None
+    # A model sold by one vendor stays keyed on its own id.
+    assert prices("claude-opus-5", "anthropic") == prices("claude-opus-5")
+    tokens = {"input": 1_000_000, "output": 1_000_000}
+    assert spend(tokens, "kimi-k3", "moonshot") > spend(tokens, "kimi-k3", "aster")
+    assert spend(tokens, "kimi-k3") == 0.0
+
+
+class _DyingStream:
+    """A stream that emits, then dies partway through, the way a reset actually arrives."""
+
+    def __init__(self, fail: bool, error: type[BaseException]):
+        self.fail, self.error = fail, error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def __iter__(self):
+        yield SimpleNamespace(type="response.output_text.delta", delta="half a th")
+        if self.fail:
+            raise self.error("[Errno 104] Connection reset by peer")
+
+    def get_final_response(self):
+        return SimpleNamespace(
+            status="completed", incomplete_details=None, usage=None,
+            output=[_item(type="message",
+                          content=[SimpleNamespace(type="output_text", text="done")])])
+
+
+def _transport_error() -> type[BaseException]:
+    for name in ("httpx2", "httpx"):
+        try:
+            return __import__(name).ReadError
+        except ImportError:
+            continue
+    pytest.skip("no httpx installed")
+
+
+def test_responses_retries_a_stream_that_dies_mid_flight(monkeypatch):
+    """A connection reset used to end the whole session.
+
+    The failure arrives from inside the SDK's own `with` block, under the layer that
+    wraps errors as `openai.APIError`, so it escaped the adapter's retry loop entirely
+    and one dropped packet threw away everything the run had not yet written down.
+    """
+    monkeypatch.setattr("openreynolds.llm.responses_api.time.sleep", lambda _: None)
+    provider = ResponsesProvider("k")
+    calls: list[dict] = []
+
+    def stream(**kwargs):
+        calls.append(kwargs)
+        return _DyingStream(fail=len(calls) == 1, error=_transport_error())
+
+    provider.client = SimpleNamespace(responses=SimpleNamespace(stream=stream))
+    said: list[str] = []
+    turn = provider.stream(model="m", system="s", messages=[], tools=[], effort="medium",
+                           max_tokens=500, listener=Listener(text=said.append))
+
+    assert len(calls) == 2, "the dropped stream was not retried"
+    assert turn.text == "done"
+    # The first attempt already printed. Saying so beats printing the reply twice with
+    # no explanation.
+    assert any("retrying" in s for s in said)
+
+
+def test_responses_gives_up_on_a_connection_that_keeps_dying(monkeypatch):
+    """Three attempts, then a ProviderError -- not an httpx traceback out of the loop."""
+    monkeypatch.setattr("openreynolds.llm.responses_api.time.sleep", lambda _: None)
+    provider = ResponsesProvider("k")
+    calls: list[dict] = []
+
+    def stream(**kwargs):
+        calls.append(kwargs)
+        return _DyingStream(fail=True, error=_transport_error())
+
+    provider.client = SimpleNamespace(responses=SimpleNamespace(stream=stream))
+    with pytest.raises(ProviderError, match="connection lost mid-stream"):
+        provider.stream(model="m", system="s", messages=[], tools=[], effort="medium",
+                        max_tokens=500, listener=Listener())
+    assert len(calls) == 3
+
+
+class _UnfinishedStream(_DyingStream):
+    """Every event arrives, the connection closes cleanly, and `response.completed`
+    never does: the SDK's RuntimeError, as prod saw it on 2026-10-30."""
+
+    def __iter__(self):
+        yield SimpleNamespace(type="response.reasoning_summary_text.delta", delta="thinking")
+
+    def get_final_response(self):
+        if self.fail:
+            raise RuntimeError("Didn't receive a `response.completed` event.")
+        return super().get_final_response()
+
+
+def test_responses_retries_a_stream_that_closes_without_completing(monkeypatch):
+    monkeypatch.setattr("openreynolds.llm.responses_api.time.sleep", lambda _: None)
+    provider = ResponsesProvider("k")
+    calls: list[dict] = []
+
+    def stream(**kwargs):
+        calls.append(kwargs)
+        return _UnfinishedStream(fail=len(calls) == 1, error=RuntimeError)
+
+    provider.client = SimpleNamespace(responses=SimpleNamespace(stream=stream))
+    turn = provider.stream(model="m", system="s", messages=[], tools=[], effort="medium",
+                           max_tokens=500, listener=Listener())
+    assert len(calls) == 2 and turn.text == "done"
+
+    calls.clear()
+    provider.client = SimpleNamespace(responses=SimpleNamespace(
+        stream=lambda **kw: calls.append(kw) or _UnfinishedStream(fail=True, error=RuntimeError)))
+    with pytest.raises(ProviderError, match="without response.completed"):
+        provider.stream(model="m", system="s", messages=[], tools=[], effort="medium",
+                        max_tokens=500, listener=Listener())
+    assert len(calls) == 3, "a ProviderError the caller retries, not a RuntimeError that ends the session"
+
+
+class _EndedStream(_DyingStream):
+    """A reply the API ended itself: `response.incomplete` or `response.failed`, then a
+    clean close. The SDK keeps a final response only for `response.completed`."""
+
+    def __init__(self, response):
+        super().__init__(fail=False, error=RuntimeError)
+        self.response = response
+
+    def __iter__(self):
+        yield SimpleNamespace(type=f"response.{self.response.status}", response=self.response)
+
+    def get_final_response(self):
+        raise RuntimeError("Didn't receive a `response.completed` event.")
+
+
+def test_responses_takes_an_incomplete_or_failed_reply_without_sending_it_again(monkeypatch):
+    """Sending again gets the same ending, billed in full each time."""
+    monkeypatch.setattr("openreynolds.llm.responses_api.time.sleep", lambda _: None)
+    provider = ResponsesProvider("k")
+    calls: list[dict] = []
+
+    def serve(response):
+        provider.client = SimpleNamespace(responses=SimpleNamespace(
+            stream=lambda **kw: calls.append(kw) or _EndedStream(response)))
+
+    def ask():
+        return provider.stream(model="m", system="s", messages=[], tools=[], effort="medium",
+                               max_tokens=500, listener=Listener())
+
+    serve(SimpleNamespace(
+        status="incomplete", incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+        output=[_item(type="message", content=[SimpleNamespace(type="output_text", text="half")])],
+        usage=SimpleNamespace(input_tokens=100, output_tokens=500,
+                              input_tokens_details=SimpleNamespace(cached_tokens=0))))
+    turn = ask()
+    assert len(calls) == 1 and turn.stop_reason == "max_tokens" and turn.text == "half"
+
+    calls.clear()
+    serve(SimpleNamespace(status="failed", output=[], usage=None,
+                          error=SimpleNamespace(code="invalid_image", message="unreadable")))
+    with pytest.raises(BadRequest, match="invalid_image"):
+        ask()
+    assert len(calls) == 1
+
+    calls.clear()
+    serve(SimpleNamespace(status="failed", output=[], usage=None,
+                          error=SimpleNamespace(code="server_error", message="try again")))
+    with pytest.raises(ProviderError, match="server_error") as caught:
+        ask()
+    assert len(calls) == 1 and not isinstance(caught.value, BadRequest)
+    assert transient(caught.value), "the turn's own retries wait and ask again"
+
+
+def test_reynolds_maps_retired_ids_and_prices_what_it_serves():
+    from openreynolds.llm.presets import (KNOWN_MODELS, context_window_for, desk_model_for,
+                                          prices, successor)
+
+    assert successor("reynolds", "claude-sonnet-5") == "claude-sonnet-5-5"
+    assert successor("reynolds", "claude-opus-5") == "claude-opus-5-5"
+    assert successor("reynolds", "gpt-5.6-sol") == "gpt-6.1-sol"
+    assert successor("reynolds", "claude-opus-5-5") == "claude-opus-5-5"
+    assert successor("anthropic", "claude-opus-5") == "claude-opus-5"  # open list there
+    assert desk_model_for("reynolds", "claude-opus-5-5") == "claude-haiku-4-5"
+    assert desk_model_for("reynolds", "gpt-6-astra") == "gpt-6-luna"
+    for model in KNOWN_MODELS["reynolds"] + ("gpt-6-luna", "claude-haiku-4-5"):
+        assert prices(model) is not None, model
+        assert context_window_for(model), model
+    assert prices("claude-opus-5-5") == {"input": 4.00, "output": 20.00,
+                                         "cache_read": 0.20, "cache_write": 5.00}
+    assert prices("claude-sonnet-5-5") == {"input": 2.00, "output": 10.00,
+                                           "cache_read": 0.20, "cache_write": 2.50}

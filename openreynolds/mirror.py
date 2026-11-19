@@ -55,14 +55,45 @@ from .browse import MAX_ENTRIES, Browser, Entry, human
 GATE_WAIT_S = 120.0
 """How long a background cycle will stand aside for a tool call before going anyway.
 
-The service runs the mirror's transfers and the model's commands on the same
+The service used to run the mirror's transfers and the model's commands on the same
 container, and a transfer that stalls there stalls the command behind it: a finish
-step timed at 27 s on the instance took 120, 236 and 323 s inside the tool call,
-each time with a cycle in flight. So a cycle waits for the tool call to end before
-it starts, and again before each round trip. Bounded, because a turn of back-to-back
-tool calls would otherwise never mirror at all -- and a bounded wait is a delay,
-which the cycle can afford, where an unbounded one is the twenty-five minutes the
-turn-end sync once cost."""
+step timed at 27 s on the instance took 120, 236 and 323 s inside the tool call, each
+time with a cycle in flight. That was true of the listing too while it was a `find`
+over the exec channel a tool call also uses; on a hosted workspace the listing now
+comes from the service's files route (`Browser.tree`, `Backend.list_stored`) and
+touches no channel a tool call is on, but the local backend and the fallback still
+walk over `exec`, so a cycle whose listing is that walk still waits for the tool call to
+end first -- once per cycle (two waits in a row once made it 244 s; see `_sync`), and
+bounded, because a turn of back-to-back tool calls would otherwise never even list
+at all, and a bounded wait is a delay, which the cycle can afford, where an unbounded
+one is the twenty-five minutes the turn-end sync once cost. It was briefly true of a
+pull as well, and the measurement took it back:
+what made an archive request stall a `bash` call was never the container's CPU, it was
+the workspace service running that request *on its event loop*, where one slow call
+stalls every other request the process is serving. With that fixed, a copy and a
+command no longer notice each other -- `echo ok` costs the same 8-10 s whether a copy
+is in flight or not -- so a live pull uses the ordinary archive again, which is five
+times faster than reading every file out of the volume one at a time (7 s against 39 s
+for two case directories). What stays is the bound: a cycle still must not sit on one
+file for minutes."""
+
+LIVE_PULL_TIMEOUT_S = 25.0
+"""How long a background cycle's own archive request may run before it gives up on it.
+
+Measured against the mesher acceptance runs (`qa-runs/LATENCY.md`): every ordinary
+round trip in that corpus, the smallest and the largest, finished in 18 s or less; the
+ones that did not finished in two to eleven *minutes* -- one path per cycle that the
+service takes about 120 s to answer 400 for (a jail probe timing out on a file this
+sandbox has never touched, `qa-runs/FINDINGS.md` F-55) and the transfer stalling in
+its company. 25 s clears every real transfer seen and cuts every one of those off
+early, at one attempt (see `max_attempts` on `Backend.get_tree`) rather than the
+five the transport retries by default -- five attempts at the ordinary 300 s timeout
+is how one awkward path turns a cycle into ten or twenty-five minutes of it, all spent
+on the same container a tool call is waiting to use. A cut-off file is not lost: it stays
+skipped, reported, and tried again next cycle, at the cost of this same 25 s again
+until it is either fetchable or the service answers its 400 fast enough to be
+remembered (`refused`) -- worse than F-55 being fixed, much better than not bounding
+this at all."""
 
 SLOW_CYCLE_S = 30.0
 """A cycle that pulled nothing and took longer than this still gets a line. Silence
@@ -110,6 +141,29 @@ asked for thirty-eight files at once and the connection closed at 6 MB of an exp
 38 MB -- so the batch failed, and every keepable file in it failed with it. Counting
 files bounds the blast radius of a failure; counting bytes stops it happening."""
 
+EARLIER_BYTES_PER_CYCLE = 64 * 1024 * 1024
+"""How much of the earlier written times one live cycle may copy, after the newest.
+
+A live cycle used to copy only the newest time of each case, so a time the solver
+wrote between two cycles never came home: a staging study (20261111-080701-6269)
+wrote a time every 2 s from 20 s to 100 s and the viewer was offered four of them. Every time
+is what the viewer is opened for -- watching a solve develop -- so the earlier ones
+come too, newest first, a whole time directory at a time, after the newest. Bounded
+per cycle so a cycle that falls behind a fast-writing solve catches up over several
+cycles rather than spending minutes in one; a single time bigger than this still
+comes, on its own, so a large mesh is slow rather than never."""
+
+EARLIER_BYTES = 1024 * 1024 * 1024
+"""And how much of them one session keeps in all.
+
+The hosted runner stages every session's files on one 40 GB disk shared by sixteen
+sessions, and a long transient solve writes far more than that: five hundred
+writes of a 100 MB time is 50 GB. Past this the earlier times stay on the instance,
+named in the report; the newest time still comes every cycle."""
+
+EARLIER_TIME = "an earlier time directory"
+"""The start of the reason a live cycle gives for a time it has not copied yet."""
+
 KEEP_SUFFIXES = frozenset(
     {
         # Renders and plots -- the whole point of running the thing.
@@ -120,6 +174,12 @@ KEEP_SUFFIXES = frozenset(
         # What the agent wrote to do the work. Small, and the record of how a number
         # was arrived at.
         ".py", ".sh",
+        # The shape itself. A `.step` handed to a study is the input nothing on this
+        # machine can reproduce, and the per-patch `.stl` set the CAD desk exports is
+        # what the mesher reads -- `casebundle.build()` packs from this mirror, so a
+        # suffix missing here is an artifact that can never be bundled. They are also
+        # the two the hosted viewer draws a case from.
+        ".step", ".stp", ".iges", ".igs", ".stl",
     }
 )
 
@@ -173,6 +233,13 @@ class MirrorReport:
     seconds: float = 0.0
     """What it cost in time, listing included. Together these are the line that
     shows whether a cycle is a convenience or the reason a session is slow."""
+    gate_wait_seconds: float = 0.0
+    """Of `seconds`, how much was spent standing aside for a tool call in flight
+    (`Gate.clear`), as opposed to actually listing or transferring. Not shown in the
+    text report -- it is diagnostic, for telling "the cycle waited" from "the cycle
+    was slow" apart (`qa-runs/LATENCY.md` asked this question of a live cycle and had
+    no way to answer it directly; this is that way). Carried in the `mirror` trace
+    event as `gate_wait_seconds`."""
 
     def cost(self) -> str:
         trips = f"{self.round_trips} round trip{'s' if self.round_trips != 1 else ''}"
@@ -318,22 +385,35 @@ def reason_to_skip_live(relative: str, newest: dict[str, str]) -> str | None:
 
     So: the mesh, the newest time, logs, postProcessing, dictionaries, images and
     surfaces all come over. What is dropped is only what is genuinely redundant --
-    per-processor copies of fields that get reconstructed, superseded time directories,
-    and formats written for a viewer that is not on this machine.
+    per-processor copies of fields that get reconstructed, and formats written for a
+    viewer that is not on this machine. An earlier time directory is named here too,
+    but `_wanted` does not drop it: it comes after the newest, within
+    `EARLIER_BYTES_PER_CYCLE` and `EARLIER_BYTES` (`_earlier_within`).
     """
+    return _live_verdict(relative, newest)[0]
+
+
+def _live_verdict(
+    relative: str, newest: dict[str, str]
+) -> tuple[str | None, tuple[str, str] | None]:
+    """`reason_to_skip_live`, and, when the reason is an earlier time, the case and
+    the time directory it judged: `("case/processors4", "20")` for
+    `case/processors4/20/U`. Returned from the same walk so the two cannot disagree
+    about which numbered directory on a path was the time."""
     parts = relative.split("/")
     for index, part in enumerate(parts[:-1]):
         if _PROCESSOR_DIR.match(part):
-            return "processor decomposition data"
+            return "processor decomposition data", None
         if part in LIVE_DROP_DIRS:
-            return "written for a viewer that is not on this machine"
+            return "written for a viewer that is not on this machine", None
         if _is_time_directory(part):
-            keep = newest.get("/".join(parts[:index]))
+            case = "/".join(parts[:index])
+            keep = newest.get(case)
             if keep is not None and part != keep:
-                return f"a superseded time directory ({part}/)"
+                return f"{EARLIER_TIME} ({part}/)", (case, part)
     if _suffix(parts[-1]) in SKIP_SUFFIXES:
-        return "written for a viewer that is not on this machine"
-    return None
+        return "written for a viewer that is not on this machine", None
+    return None, None
 
 
 PRIORITY_SUFFIXES = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg")
@@ -395,6 +475,12 @@ def reason_by_size(relative: str, size: int) -> str | None:
     mesh. The same `0/U` on a half-million-cell mesh is nine megabytes, and it is
     field data whatever directory it is sitting in. Keeping it by location alone
     turned a 43-file mirror into 42 MB of it.
+
+    The suffix escape hatch is what carries the CAD desk's output: a per-patch
+    `constant/triSurface/*.stl` is routinely larger than a dictionary ever is, and it
+    is geometry rather than field data. It is kept because `.stl` is in
+    `KEEP_SUFFIXES`, not because of where it sits, which is the same rule a `log.` or
+    a `.png` in the same directory is kept by.
     """
     if size <= DICTIONARY_BYTES:
         return None
@@ -420,6 +506,7 @@ def sync(
     max_total_bytes: int = MAX_TOTAL_BYTES,
     refused: dict[str, str] | None = None,
     gate: "Gate | None" = None,
+    stopping: Callable[[], bool] | None = None,
 ) -> MirrorReport:
     """Copy down what has changed under the study's directory, and say what it did not.
 
@@ -436,11 +523,13 @@ def sync(
     so asks again, which is what "tries them again" in the report promises.
 
     `gate` is where a session says a tool call is in flight; a cycle given one stands
-    aside for it before each round trip (see GATE_WAIT_S).
+    aside for it once, and only when its listing is a command on the workspace (see
+    GATE_WAIT_S). `stopping` ends that wait early, so a mirror being stopped is not
+    held by it.
     """
     started = time.monotonic()
     report = _sync(browser, path, everything, live, background, max_file_bytes,
-                   max_total_bytes, refused, gate)
+                   max_total_bytes, refused, gate, stopping)
     report.seconds = time.monotonic() - started
     return report
 
@@ -455,6 +544,7 @@ def _sync(
     max_total_bytes: int,
     refused: dict[str, str] | None,
     gate: "Gate | None",
+    stopping: Callable[[], bool] | None = None,
 ) -> MirrorReport:
     store = browser.store
     if store is None:
@@ -463,8 +553,28 @@ def _sync(
     report = MirrorReport(local_dir=store.fetch_dir(), study_id=store.session.study_id)
     root = path or browser.home or WORKSPACE_ROOT
 
+    # One wait for a tool call per cycle, and only when the listing is a `find` over
+    # the exec channel the call is using. The service's files route touches no such
+    # channel, so a hosted workspace lists without waiting. It used to be asked here
+    # and in `LiveMirror._run` as well, each bounded by GATE_WAIT_S, and the two
+    # bounds added up: during a five-minute solve call on staging
+    # (20261111-080701-6269, 08:39:44 to 08:44:57) the first listing came at 08:43:48,
+    # 244 s in, and every time the solver wrote before 76 s was never seen.
+    def stand_aside() -> None:
+        report.gate_wait_seconds += _timed_clear(gate, GATE_WAIT_S, stopping)
+        if stopping is not None and stopping():
+            # The wait was cut short because the mirror is stopping, not because the
+            # call ended: walking now would be the command the wait exists to keep
+            # off the call's channel, and the close-down sync follows anyway.
+            raise _Stopped
+
     try:
-        entries = browser.tree(root, depth=DEPTH, background=background)
+        entries = browser.tree(
+            root, depth=DEPTH, background=background,
+            before_walk=stand_aside if gate is not None else None,
+        )
+    except _Stopped:
+        return report
     except (BackendError, OSError) as exc:
         if getattr(exc, "code", "") == "workspace_idle":
             # The expected steady state of an idle session, not a fault: there is no
@@ -479,25 +589,31 @@ def _sync(
     # files pane wants to draw. Remember it so showing the workspace is free.
     browser.remember(root, entries)
 
-    # `find` output is capped, so the tail of a very large workspace was never examined
-    # at all. That is a different thing from there being nothing there.
+    # A listing is capped -- at `MAX_ENTRIES` here, at 5,000 on the service, and by
+    # bytes on the exec channel when the walk is what ran -- so the tail of a very
+    # large workspace was never examined at all. That is a different thing from there
+    # being nothing there.
     #
     # Asked of the listing rather than counted here. `len(entries) >= MAX_ENTRIES` was a
     # guess from the outside and it was wrong at the boundary: a workspace holding
     # exactly MAX_ENTRIES entries is complete, and this called it truncated. `browse`
-    # now asks `find` for one more line than it will keep, so the flag is measured. The
-    # wording lives there too -- one sentence, in one place, rather than two that drift.
+    # measures the flag (one line more than it keeps from the walk; the service's own
+    # word for its cap; the backend's word for a cut output) and words the notice for
+    # whichever cap it was -- one sentence, in one place, rather than two that drift.
     if getattr(entries, "truncated", False):
         report.warnings.append(entries.notice)
 
-    candidates = _wanted(
-        entries, root, report, everything, max_file_bytes, live=live, refused=refused
+    now, times = _wanted(
+        entries, root, report, everything, max_file_bytes, live=live, refused=refused,
+        earlier_times=gate is not None,
     )
-    _pull(
-        browser, _within_budget(candidates, report, max_total_bytes), report,
-        refused=refused, gate=gate,
-    )
+    wanted, later = _within_budget(now, times, report, max_total_bytes)
+    _pull(browser, wanted, report, refused=refused, gate=gate, later=later)
     return report
+
+
+class _Stopped(Exception):
+    """Raised out of a cycle's listing when the mirror stopped while it waited."""
 
 
 def local_for(local_dir: Path, remote: str) -> Path:
@@ -525,33 +641,53 @@ def _wanted(
     max_file_bytes: int,
     live: bool = False,
     refused: dict[str, str] | None = None,
-) -> list[Entry]:
+    earlier_times: bool = False,
+) -> tuple[list[Entry], list[tuple[str, list[Entry]]]]:
     """Files worth asking for: not filtered out, not too big, not already here, and
-    not refused by the service already this session."""
+    not refused by the service already this session. Returned in two parts: the rest,
+    and apart from them a live cycle's earlier time directories, each one's name and
+    files, newest first (`_earlier_within`), which go after the rest.
+
+    `earlier_times` is only for a background cycle, whose round trips are bounded
+    (`LIVE_PULL_TIMEOUT_S`). The close-down sync is what the end of a session waits
+    on, so it brings the newest time as it always did and leaves the backlog named."""
     wanted = []
     newest = newest_times(entries, root) if live else {}
+    earlier: dict[tuple[str, str], list[Entry]] = {}
+    blocked: set[tuple[str, str]] = set()
+    earlier_here = 0
     for entry in entries:
         if entry.is_dir:
             continue
-        if refused and entry.path in refused:
-            # Named and counted like every other file left behind. This is the
-            # opposite of dropping it quietly: the path failed once, the reason is
-            # here, and the retry is a command away.
-            report.skipped.append(Skip(entry.path, refused[entry.path], entry.size))
-            continue
         relative = _relative(entry.path, root)
+        held = None
         if live:
-            reason = reason_to_skip_live(relative, newest)
+            reason, held = _live_verdict(relative, newest)
+            if held is not None and earlier_times:
+                reason = None
+            else:
+                held = None
         elif everything:
             reason = None
         else:
             reason = reason_to_skip(relative) or reason_by_size(relative, entry.size)
+        if refused and entry.path in refused:
+            # Named and counted like every other file left behind. This is the
+            # opposite of dropping it quietly: the path failed once, the reason is
+            # here, and the retry is a command away.
+            reason = refused[entry.path]
+        if reason and held is not None:
+            # An earlier time is copied whole or not at all (`_earlier_within`), so
+            # a file of it left behind holds back the rest of it this cycle.
+            blocked.add(held)
         if reason:
             report.skipped.append(Skip(entry.path, reason, entry.size))
             continue
         if entry.size > max_file_bytes:
             # The cap holds even under `--all`: "everything" is a statement about
             # which files are interesting, not about how much disk to use.
+            if held is not None:
+                blocked.add(held)
             report.skipped.append(
                 Skip(
                     entry.path,
@@ -562,38 +698,117 @@ def _wanted(
             continue
         if _already_here(local_for(report.local_dir, entry.path), entry):
             report.unchanged += 1
+            if held is not None:
+                earlier_here += entry.size
+            continue
+        if held is not None:
+            earlier.setdefault(held, []).append(entry)
             continue
         wanted.append(entry)
-    return wanted
+    for key in blocked:
+        for entry in earlier.pop(key, []):
+            report.skipped.append(Skip(
+                entry.path, f"{EARLIER_TIME} ({key[1]}/), held back with a file of it",
+                entry.size,
+            ))
+    return wanted, _earlier_within(earlier, earlier_here, report)
+
+
+def _earlier_within(
+    earlier: dict[tuple[str, str], list[Entry]], here: int, report: MirrorReport
+) -> list[tuple[str, list[Entry]]]:
+    """The earlier time directories this cycle copies, newest first, whole: each
+    one's name and files, so the sync budget can keep each one whole too.
+
+    Whole, because a time with half its fields is one the viewer lists and cannot
+    draw. Newest first, because those are the ones nearest what the user is looking
+    at. Within `EARLIER_BYTES_PER_CYCLE`, except that a cycle that has taken nothing
+    yet takes one time whatever its size; and within what is left of
+    `EARLIER_BYTES` once the ones already here are counted (`here`). The rest are
+    named in the report and asked for again next cycle."""
+    cycle_left = EARLIER_BYTES_PER_CYCLE
+    kept_left = EARLIER_BYTES - here
+    taken: list[tuple[str, list[Entry]]] = []
+    # Newest first within each case, and the cases taken in turn: a steady case's
+    # times are iteration counts in the thousands and a transient one's are seconds,
+    # so one order by value across cases would give the steady one everything.
+    by_case: dict[str, list[str]] = {}
+    for case, name in earlier:
+        by_case.setdefault(case, []).append(name)
+    rank = {
+        (case, name): index
+        for case, names in by_case.items()
+        for index, name in enumerate(sorted(names, key=float, reverse=True))
+    }
+    order = sorted(earlier, key=lambda key: (rank[key], key[0]))
+    waiting = full = False
+    for case, name in order:
+        files = earlier[(case, name)]
+        size = sum(entry.size for entry in files)
+        if full or size > kept_left:
+            full = True
+            reason = f"{EARLIER_TIME} ({name}/), past the {human(EARLIER_BYTES)} kept of them"
+        elif waiting or (taken and size > cycle_left):
+            # Stop at the first that does not fit, so the order holds: a smaller,
+            # older time does not jump the one a later cycle will bring.
+            waiting = True
+            reason = f"{EARLIER_TIME} ({name}/), for a later cycle"
+        else:
+            taken.append((name, files))
+            cycle_left -= size
+            kept_left -= size
+            continue
+        report.skipped.extend(Skip(entry.path, reason, entry.size) for entry in files)
+    return taken
 
 
 def _within_budget(
-    candidates: list[Entry], report: MirrorReport, max_total_bytes: int
-) -> list[Entry]:
-    """As much as fits, smallest first.
+    now: list[Entry],
+    times: list[tuple[str, list[Entry]]],
+    report: MirrorReport,
+    max_total_bytes: int,
+) -> tuple[list[Entry], dict[str, int]]:
+    """As much as fits, smallest first, and a live cycle's earlier times after that.
+    Returns the files, and of those the earlier times' paths with their time's rank,
+    which `_batches` sends last.
 
     Smallest first because of what running out should cost: one enormous log left
     behind is a sentence in the report, and three hundred dictionaries left behind
     because that log went first is the study missing.
+
+    `times` is the earlier-time backfill, newest first, from `_wanted`. It is spent
+    on last, so it never pushes out the newest time, which is what the viewer opens
+    on; and a whole time at a time, stopping at the first that does not fit, for the
+    reasons `_earlier_within` gives. Sorted in with the rest, two 2 KB fields of an
+    earlier time took a 5 KB budget ahead of the newest time's one 2 KB field, and
+    left that time behind (#100).
     """
     budget = max_total_bytes
     wanted = []
-    for entry in sorted(candidates, key=lambda item: (item.size, item.path)):
+    over = f"past the {human(max_total_bytes)} budget for one sync"
+    for entry in sorted(now, key=lambda item: (item.size, item.path)):
         if entry.size > budget:
-            report.skipped.append(
-                Skip(
-                    entry.path,
-                    f"past the {human(max_total_bytes)} budget for one sync",
-                    entry.size,
-                )
-            )
+            report.skipped.append(Skip(entry.path, over, entry.size))
             continue
         budget -= entry.size
         wanted.append(entry)
-    return wanted
+
+    later: dict[str, int] = {}
+    full = False
+    for rank, (name, files) in enumerate(times):
+        size = sum(entry.size for entry in files)
+        if full or size > budget:
+            full = True
+            reason = f"{EARLIER_TIME} ({name}/), {over}, held back whole"
+            report.skipped.extend(Skip(entry.path, reason, entry.size) for entry in files)
+            continue
+        budget -= size
+        wanted.extend(files)
+        later.update((entry.path, rank) for entry in files)
+    return wanted, later
 
 
-def _batches(wanted: list[Entry]) -> list[list[Entry]]:
+def _batches(wanted: list[Entry], later: dict[str, int] | None = None) -> list[list[Entry]]:
     """Split into round trips bounded by both count and bytes.
 
     A single file over the byte budget still goes on its own rather than being dropped
@@ -608,7 +823,16 @@ def _batches(wanted: list[Entry]) -> list[list[Entry]]:
     # decomposed solve the smallest files are the per-processor ones, so a 200 KB render
     # the model had just looked at sat behind thousands of them -- nine minutes for one
     # picture, and a second that never arrived before the session ended.
-    for entry in sorted(wanted, key=lambda item: (_priority(item), item.size, item.path)):
+    # And an earlier time directory goes after everything else: the newest time is
+    # what the viewer opens on, and a cycle cut short should have brought that.
+    later = later or {}
+
+    def order(item: Entry) -> tuple:
+        if item.path in later:
+            return (3, later[item.path], item.path)
+        return (_priority(item), item.size, item.path)
+
+    for entry in sorted(wanted, key=order):
         if current and (len(current) >= BATCH or carried + entry.size > BATCH_BYTES):
             batches.append(current)
             current, carried = [], 0
@@ -625,6 +849,7 @@ def _pull(
     report: MirrorReport,
     refused: dict[str, str] | None = None,
     gate: "Gate | None" = None,
+    later: dict[str, int] | None = None,
 ) -> None:
     """Fetch in batches, and treat a failed batch as a fact rather than an end.
 
@@ -633,8 +858,8 @@ def _pull(
     company, and losing the company with it is how a mirror comes back empty from a
     study that had plenty worth keeping -- which is exactly what a live run did.
     """
-    for batch in _batches(wanted):
-        _pull_batch(browser, batch, report, refused, gate)
+    for batch in _batches(wanted, later):
+        _pull_batch(browser, batch, report, refused, gate, later)
 
 
 def _pull_batch(
@@ -643,6 +868,7 @@ def _pull_batch(
     report: MirrorReport,
     refused: dict[str, str] | None,
     gate: "Gate | None",
+    later: dict[str, int] | None = None,
 ) -> bool:
     """One archive request, and what to do when it fails. True when it came down.
 
@@ -655,22 +881,38 @@ def _pull_batch(
     file whose failure is a fact about the path is remembered and not asked for again
     this session. Which file it was is named, because the log never said.
     """
-    if gate is not None:
-        gate.clear(GATE_WAIT_S)
+    # `gate is not None` is exactly "this cycle is running in the background while a
+    # tool call may be in flight" (see `LiveMirror._cycle`), and what it buys is the
+    # bound below, not a different route. Both were tried: for one afternoon a live
+    # pull asked the backend for a copy that avoids the workspace's compute container
+    # altogether, on the reasoning that a slow archive request here was a `bash` call
+    # stalled behind it. The reasoning was right about the symptom and wrong about the
+    # cause -- the stall was the service running that request on its own event loop,
+    # not the container's CPU -- and with that fixed, measured directly
+    # (`qa-runs/LATENCY.md`, `tail_probe.py`): a copy in flight costs a concurrent
+    # `echo ok` nothing either way, and the volume route is five times slower to copy
+    # (39 s against 7 s). So the ordinary archive it is, bounded: this cycle must not
+    # sit on one file for minutes even when nothing else is waiting on it.
     report.round_trips += 1
     try:
-        written = browser.backend.get_tree([entry.path for entry in batch], report.local_dir)
+        if gate is not None:
+            written = browser.backend.get_tree(
+                [entry.path for entry in batch], report.local_dir,
+                timeout=LIVE_PULL_TIMEOUT_S, max_attempts=1,
+            )
+        else:
+            written = browser.backend.get_tree([entry.path for entry in batch], report.local_dir)
     except (BackendError, OSError) as exc:
         if len(batch) > 1:
             report.warnings.append(
                 f"a batch of {len(batch)} failed ({exc}); looking for the file it failed on"
             )
             for index, entry in enumerate(batch):
-                if _pull_batch(browser, [entry], report, refused, gate):
+                if _pull_batch(browser, [entry], report, refused, gate, later):
                     continue
                 rest = batch[index + 1 :]
                 if rest:
-                    _pull_batch(browser, rest, report, refused, gate)
+                    _pull_batch(browser, rest, report, refused, gate, later)
                 return False
             return True
         entry = batch[0]
@@ -678,6 +920,12 @@ def _pull_batch(
         report.skipped.append(Skip(entry.path, "the copy failed", entry.size))
         if refused is not None and is_a_fact_about_the_path(exc):
             refused[entry.path] = refusal(exc)
+        elif refused is not None and later and entry.path in later:
+            # An earlier time is a nicety, and one that will not copy must not hold
+            # every older time behind it, cycle after cycle (`_earlier_within` takes
+            # them newest first). So it is set aside for the session, whole, like a
+            # path the service refused; `openreynolds pull` asks for it again.
+            refused[entry.path] = f"{EARLIER_TIME} that did not copy this session ({exc})"
         return False
     report.pulled.extend(written)
     report.bytes_pulled += sum(entry.size for entry in batch)
@@ -743,9 +991,11 @@ class Gate:
     """Where a session says a tool call is in flight, so the mirror stays out of its way.
 
     The session's thread holds it around each tool call; the mirror's thread asks
-    `clear` before it starts a cycle and before each round trip, and waits -- bounded
-    by GATE_WAIT_S -- for the call to end. Nothing here ever blocks the session: the
-    session only counts, and the counting is a lock held for nanoseconds.
+    `clear` once a cycle, before a listing that walks the workspace over the exec
+    channel, and waits -- bounded by GATE_WAIT_S -- for the call to end (a live pull no longer asks at all; see
+    `GATE_WAIT_S`'s docstring and `_pull_batch`). Nothing here ever blocks the
+    session: the session only counts, and the counting is a lock held for
+    nanoseconds.
     """
 
     def __init__(self) -> None:
@@ -789,6 +1039,23 @@ class Gate:
                 # In slices, so `unless` is looked at even when nobody notifies.
                 self._cond.wait(min(remaining, 0.5))
             return True
+
+
+def _timed_clear(
+    gate: Gate, timeout: float, unless: Callable[[], bool] | None = None
+) -> float:
+    """`gate.clear`, and how long it took -- so a cycle can say how much of its own
+    wall time was standing aside versus doing anything (`MirrorReport.gate_wait_seconds`,
+    asked for directly in `qa-runs/LATENCY.md`: whether the Gate was actually the
+    bottleneck, or just where the clock happened to be ticking, was not answerable
+    from the report before this).
+
+    `timeout` has no default on purpose: `GATE_WAIT_S` is read at the call site, not
+    captured here, so a test (or a future caller) that changes it after this module
+    loads is still honoured -- a default parameter value is bound once, at `def`."""
+    started = time.monotonic()
+    gate.clear(timeout, unless=unless)
+    return time.monotonic() - started
 
 
 class LiveMirror:
@@ -864,7 +1131,12 @@ class LiveMirror:
         background cycles by the same lock.
 
         Foreground by definition: something asked for it, so the workspace is in use
-        and may be started if it is not up."""
+        and may be started if it is not up -- but only when there is nothing else to
+        read. On a backend that can list the workspace without a command on it, the
+        listing comes from the service whether the machine is up or down
+        (`Browser.tree`), and on a stopped workspace the files follow from the same
+        copy, so the close-down sync of a session whose workspace the service has
+        already stopped no longer starts a machine to list what it can be told."""
         return self._cycle()
 
     def catch_up(self) -> MirrorReport | None:
@@ -898,12 +1170,9 @@ class LiveMirror:
             # it counted as use, a hosted workspace could never be reclaimed and
             # billed until its 24-hour ceiling. It does not count.
             #
-            # And not while the model is in a tool call: the cycle's listing and
-            # transfers run on the same container as the call, and the call waits
-            # behind them. Bounded, so a busy turn still gets mirrored eventually.
-            self.gate.clear(GATE_WAIT_S, unless=self._stop.is_set)
-            if self._stop.is_set():
-                return
+            # Not while the model is in a tool call, when the listing is a command on
+            # the call's channel -- that wait is in `sync`, once, where it knows which
+            # listing it is taking (see GATE_WAIT_S).
             self._cycle(background=True)
 
     def _cycle(self, *, background: bool = False) -> MirrorReport:
@@ -919,6 +1188,7 @@ class LiveMirror:
                     # somebody asked for -- the close-down one -- is the thing being
                     # waited on, and nothing is in flight to wait for.
                     gate=self.gate if background else None,
+                    stopping=self._stop.is_set,
                 )
             except Exception as exc:  # noqa: BLE001 - a convenience may not end a session
                 report = MirrorReport(
@@ -931,7 +1201,9 @@ class LiveMirror:
                     "mirror", background=background, pulled=len(report.pulled),
                     bytes=report.bytes_pulled, skipped=len(report.skipped),
                     unchanged=report.unchanged, round_trips=report.round_trips,
-                    seconds=round(report.seconds, 3), warnings=list(report.warnings),
+                    seconds=round(report.seconds, 3),
+                    gate_wait_seconds=round(report.gate_wait_seconds, 3),
+                    warnings=list(report.warnings),
                 )
             # Surface and assemble the pictures this cycle brought home. Inside the
             # lock is deliberate: it reads the same files the sync just wrote, and a

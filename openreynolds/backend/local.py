@@ -46,6 +46,7 @@ from .base import (
     JobStatus,
     Stat,
 )
+from .kernel import KernelHost
 
 DEFAULT_ROOT = Path.home() / ".openreynolds" / "work"
 """Where the workspace lives when nothing says otherwise."""
@@ -98,7 +99,7 @@ class _Job:
     watcher: threading.Thread | None = None
 
 
-class LocalBackend(Backend):
+class LocalBackend(KernelHost, Backend):
     """A workspace on this machine."""
 
     def __init__(self, root: str | Path | None = None, bashrc: str | None = None):
@@ -187,7 +188,11 @@ class LocalBackend(Backend):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
 
-    def get_file(self, path: str, offset: int = 0, limit: int | None = None) -> bytes:
+    def get_file(
+        self, path: str, offset: int = 0, limit: int | None = None,
+        *, timeout: float = 300.0, max_attempts: int | None = None,
+    ) -> bytes:
+        del timeout, max_attempts  # no network here to bound; see HostedBackend.get_file
         target = self._resolve(path)
         try:
             with open(target, "rb") as handle:
@@ -198,7 +203,8 @@ class LocalBackend(Backend):
         except IsADirectoryError as exc:
             raise BackendError(f"{path} is a directory", "is_a_directory") from exc
 
-    def stat(self, path: str) -> Stat:
+    def stat(self, path: str, *, timeout: float = 300.0, max_attempts: int | None = None) -> Stat:
+        del timeout, max_attempts
         target = self._resolve(path)
         try:
             info = target.stat()
@@ -214,7 +220,19 @@ class LocalBackend(Backend):
         target = self._resolve(remote_dir)
         shutil.copytree(Path(local_dir), target, dirs_exist_ok=True)
 
-    def get_tree(self, remote_paths: list[str], local_dir: Path) -> list[Path]:
+    def get_tree(
+        self,
+        remote_paths: list[str],
+        local_dir: Path,
+        *,
+        timeout: float = 300.0,
+        max_attempts: int | None = None,
+        via: str | None = None,
+    ) -> list[Path]:
+        # A local copy has no network to time out or retry on, and nothing to route
+        # around, so all three are accepted and ignored -- the mirror can pass them
+        # unconditionally regardless of which backend it is talking to.
+        del timeout, max_attempts, via
         out: list[Path] = []
         destination = Path(local_dir)
         destination.mkdir(parents=True, exist_ok=True)
@@ -222,7 +240,14 @@ class LocalBackend(Backend):
             source = self._resolve(path)
             if not source.exists():
                 continue
-            landing = destination / source.name
+            # Where the mirror expects it (`mirror.local_for`): the path's shape under the
+            # workspace root, as the hosted backend's archive keeps it. By its bare name
+            # it landed where `local_for` never looked, and two directories' `faces`
+            # were one file.
+            try:
+                landing = destination / source.relative_to(self.root)
+            except ValueError:
+                landing = destination / source.name
             if source.is_dir():
                 shutil.copytree(source, landing, dirs_exist_ok=True)
                 out.extend(p for p in landing.rglob("*") if p.is_file())
@@ -311,10 +336,18 @@ class LocalBackend(Backend):
         else:
             if job.ended_at is None:
                 job.ended_at = _now()
+                # As the service words it: a KILL or TERM this side did not send (-9
+                # or -15, or 137/143 from the `bash -lc` wrapper around the solver) is
+                # killed_externally; any other non-zero exit, a segfault included, is
+                # the job's own failure.
                 job.end_reason = job.end_reason or (
-                    "completed" if code == 0 else "killed_by_client" if code < 0 else "completed"
+                    "completed" if code == 0
+                    else "killed_externally" if code in (-9, -15, 137, 143)
+                    else "failed"
                 )
-            status = "exited" if code >= 0 and job.end_reason == "completed" else "killed"
+            # `exited` for an exit the job reached, `killed` for a stop or a kill_on.
+            status = ("exited" if job.end_reason in ("completed", "failed", "killed_externally")
+                      else "killed")
             reason = job.end_reason
         return JobStatus(
             job_id=job_id, status=status, name=job.name,
@@ -350,6 +383,10 @@ class LocalBackend(Backend):
         """Nothing to stop: the workspace is a directory, and it stays."""
 
     def close(self) -> None:
-        """Jobs outlive the session by design, so this only lets go of the handles."""
+        """Jobs outlive the session by design, so this only lets go of the handles.
+
+        The kernel is the exception: it is this session's, holds this session's
+        bindings, and nothing else can use it, so it goes down here."""
+        self.kernel_stop()
         with self._lock:
             self._jobs.clear()

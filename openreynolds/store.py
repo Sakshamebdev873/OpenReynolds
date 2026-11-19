@@ -43,6 +43,29 @@ class Session:
     remote_study_id: str = ""
     """Id assigned by the capture plane, when capture is on."""
     model: str = ""
+    provider: str = ""
+    """Whose model that was (`llm/presets.py`). Empty on studies made before the
+    provider was recorded, and a resume reads that as a model it cannot place: an id
+    does not name a provider on its own -- `claude-opus-5` was valid on `anthropic` and
+    on `reynolds` both -- so those studies carry on on whatever the configuration says."""
+    base_url: str = ""
+    """Where that model was served from: `llm_base_url` as configured, empty for the
+    preset's own endpoint.
+
+    The pair alone is not enough. Two bring-your-own keys of one family -- a vendor's
+    own and a gateway or router in front of it -- list different model ids, so a pair
+    restored across endpoints asks a vendor for a model it has never heard of and fails
+    a turn later with its 400. A study written before this was recorded has no
+    `base_url` key at all, which a resume reads as "not recorded" rather than guessing
+    an endpoint for it."""
+    mode: str = ""
+    """How much the person chose to be consulted (`modes.py`). Empty on studies made
+    before modes existed, which a resume reads as whatever the configuration says."""
+    solver: str | None = None
+    """`openfoam` or `felix`, fixed once for the whole study (`solvers.py`), and
+    written the moment it is known. None (`null` on disk) while the agent has yet to
+    choose. A record from before solvers existed has no `solver` key at all
+    (`Store.recorded_solver`), and is an OpenFOAM study."""
     home: str = ""
     """This study's own directory in the workspace.
 
@@ -51,6 +74,11 @@ class Session:
     created_at: str = ""
     title: str = ""
     capture_seq: int = 0
+    checkpoint: dict[str, Any] | None = None
+    """What the last End established about the workspace's durable copy
+    (`cli._checkpoint_the_study`): `asked_at`, and then `taken_at`, `manifest_key` and
+    `files` for a copy that landed, `stopped` for a workspace already down, or `error`
+    for one that could not be made. None until a session has ended."""
     jobs: dict[str, JobRecord] = field(default_factory=dict)
 
 
@@ -67,6 +95,9 @@ class Store:
         one-word answer that does not involve the nested `files/<id>/.../renders`
         path the workspace happens to use."""
         self.session = Session(study_id=study_id, created_at=_now())
+        self._solver_on_record = False
+        """Whether the record on disk has a `solver` key, null or not: what tells a
+        study still choosing from one recorded before solvers existed."""
         self._load()
 
     # -- persistence -----------------------------------------------------------
@@ -87,8 +118,18 @@ class Store:
         except (OSError, json.JSONDecodeError):
             return
         jobs = {jid: JobRecord(**rec) for jid, rec in (raw.pop("jobs", {}) or {}).items()}
+        self._solver_on_record = "solver" in raw
         known = {f.name for f in Session.__dataclass_fields__.values()}
         self.session = Session(**{k: v for k, v in raw.items() if k in known}, jobs=jobs)
+
+    @property
+    def recorded_solver(self) -> str | None:
+        """What the record says of the solver: `openfoam` or `felix` once chosen,
+        `auto` for a study recorded still choosing, None for no record of one -- a
+        study from before solvers existed, or one this machine has never held."""
+        if self.session.solver in ("openfoam", "felix"):
+            return self.session.solver
+        return "auto" if self._solver_on_record else None
 
     def save(self) -> None:
         payload = asdict(self.session)
@@ -112,12 +153,19 @@ class Store:
 
     # -- jobs ------------------------------------------------------------------
 
-    def recent_messages(self, limit: int = 30) -> list[dict[str, Any]]:
+    def recent_messages(self, limit: int = 30,
+                        roles: tuple[str, ...] | None = None) -> list[dict[str, Any]]:
         """The last few transcript rows, oldest-first.
 
-        The concierge reads these to answer the user without a turn from the main
-        thread. Append-only, so reading the tail never races an appending writer:
-        a half-written final line is dropped rather than raised on."""
+        Read from other threads than the one writing. Append-only, so reading the tail never races an appending writer:
+        a half-written final line is dropped rather than raised on.
+
+        `roles` keeps the last `limit` rows **of those roles** rather than the last
+        `limit` rows of everything. The CAD desk reads the person's own words this way
+        (`cad.agent.CadDesk._said`), and since the desk's own steps are transcript
+        rows too -- up to thirty a run, plus the reviews -- a second call to the desk
+        in one session would otherwise find its forty-row window full of the first
+        call's progress and none of what the person said."""
         path = self._messages_path
         if not path.exists():
             return []
@@ -125,12 +173,18 @@ class Store:
             lines = path.read_text(encoding="utf-8").splitlines()
         except OSError:
             return []
-        rows = []
-        for line in lines[-limit:]:
+        rows: list[dict[str, Any]] = []
+        for line in reversed(lines):
             try:
-                rows.append(json.loads(line))
+                row = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if roles is not None and row.get("role") not in roles:
+                continue
+            rows.append(row)
+            if len(rows) >= limit:
+                break
+        rows.reverse()
         return rows
 
     def record_job(self, job_id: str, cmd: str, name: str | None, cwd: str = "") -> JobRecord:

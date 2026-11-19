@@ -111,6 +111,83 @@ repair rather than with a log; `first_look.py` puts the geometry, the whole mesh
 close-up on whatever was refined, the named patches and the counts on one contact sheet,
 which is one `read_file` rather than five.
 
+## Which mesher puts layers on a wall, and what each one costs
+
+snappyHexMesh's layer stage is a loop: it shrinks the mesh back from the wall, inserts
+prisms into the void, and then deletes them wherever a quality metric fails, `nLayerIter`
+times over. On the Wigley hull on 2026-08-31 that loop reached **88.6% coverage on its
+first growth iteration and eroded to 66.7% by its fiftieth** — and then printed 66.7% and
+exited 0. cfMesh's `cartesianMesh` extrudes a boundary-layer sheet over the patch and
+optimises quality *afterwards*, so nothing in it can un-extrude a face; on the same hull
+it covered 100.0%. Both numbers are the same measurement, `layer_report.py` in this
+directory, which is the only reason they can sit in one table: snappy reports its own
+layer table, cfMesh reports nothing comparable, and the hybrid route reports nothing at
+all. Where snappy does report a number the measurement agreed with it, 65.2% against
+66.7%, which is what licenses believing the 100.0%.
+
+Four rounds of that replication read the missing layers as a dictionary problem and spent
+their budget on layer parameters. They are not a dictionary problem, and the measurements
+say so in both directions: ESI's own `airfoilWithLayers` settings copied wholesale give
+**0%** on this hull rather than fixing it — its *thickness spec* is the poison
+(`relativeSizes true`, `minThickness 0.1`), because on this background a thickness
+expressed as a fraction of the local cell is larger than the cell it has to fit in — while
+the *termination controls* everyone expects to be the answer (`featureAngle 180`,
+`maxFaceThicknessRatio 1000`, `nGrow -1`, `slipFeatureAngle 10`) are worth **+1.6 points**,
+66.7% → 68.3%. They are worth adopting and they are not the missing ingredient.
+
+Which to reach for is a real choice with a real cost either way:
+
+- **snappyHexMesh** is the only one of the two that takes an absolute first-layer
+  thickness, so it is the only one where a **y⁺ target** can be *asked for*. Its coverage
+  then has to be measured rather than read off its own report.
+- **cfMesh `cartesianMesh`** covers the wall, and has **no y⁺ control at all**: the stack
+  is sized from the local cell, first cell = `edge / (1 + r + … + r^(n-1))`, and
+  `maxFirstLayerThickness` is a cap on that rather than a target. The 1.21 mm first cell
+  measured on the Wigley hull is a consequence of the cell size. Its octree is isotropic,
+  so a fine wall is fine everywhere, and the domain box is *geometry* — a closed
+  multi-solid surface, no `locationInMesh`, no `blockMesh`.
+- **The hybrid** — snappy's geometry with cfMesh's `generateBoundaryLayers` — reached
+  86.9% at a 10.68 mm first cell, took 21 minutes on a 246k-cell mesh, and left a mesh
+  that had to be repaired before anything would open it.
+
+cfMesh is **already on the image**, prebuilt in the `openfoam2512` package: no build, no
+volume, no exports. It was there for all four rounds. `cfmesh.py` in this directory is the
+route — `where` says whether it is still true of the image you are on, `box` writes the
+body and its domain box as one closed STL, `case` writes the `meshDict`, `prepare` makes
+an existing snappy mesh readable, and `check` reads back what the mesh actually got.
+
+Two things about that `meshDict` cost a round each and are worth carrying separately,
+because neither announces itself:
+
+- **The keys and the `surfaceFile` decide each other.** `surfaceFeatureEdges` splits
+  each solid at the feature angle and renames the pieces `<solid>_<index>`, so against
+  the `.ftr` it writes, every key has to be the regex `"hull_.*"` — a literal matches
+  nothing, warns *once* on the mesh side and **nothing at all** on the surface side
+  (that warning is compiled out), then meshes with no refinement and no layers at exit
+  0. Against a **raw** `.stl` or `.fms` the opposite holds: no rename has happened, the
+  solid names arrive verbatim, the literal is the right key, and `"hull_.*"` is the one
+  that misses. Most of cfMesh's own tutorials are the second kind. Read `surfaceFile`
+  before judging a key; `cfmesh.py check` does.
+- **`renameBoundary` merges everything it was not told about.** Because `defaultName` is
+  present, cfMesh folds every unnamed solid into *one* patch — added only where a solid
+  is in fact left unnamed, so naming all of them leaves no `farField` at all — and a
+  dictionary that names only the hull produces a **two-patch mesh**: `hull` and a `farField`
+  carrying all six domain-box faces, pointing six ways. There is then no inlet and no
+  outlet to attach a directional boundary condition to, and `case_gen.py`, which infers
+  the inlet from a patch's own normal aimed at the domain centre, cannot recover them.
+  Name the faces the case needs (`--patch xMin:patch`, `--symmetry yMin`) at the moment
+  the dictionary is written. A mesh that cannot be given an inlet and an outlet is not
+  the basis of the grid-convergence study the rest of this section is arguing for.
+
+The reason any of this matters beyond one hull: the erosion is **silent and monotonic**,
+so a study reads snappy's own number, calls it a mesh-quality problem and re-tunes. An
+earlier grid study had to be thrown away because coverage varied 75/88/91% across its
+members while Cv/Cf drifted 1.009 → 1.159 — it had measured mesh-dependent wall treatment
+and called it discretisation error. **Until layer coverage is reproducible across a grid
+family there is no defensible grid-convergence study on any body with a thin trailing edge
+or a sharp bilge**, which is most of marine and most of external aero. Measure coverage on
+every member of a ladder before extrapolating anything from it.
+
 ## Before a solve
 
 The mesh being built is not the same question as the case being runnable, and the
@@ -231,6 +308,134 @@ under-relaxation makes a marginally stable steady solve diverge, that is not a n
 failure to be patched; it is among the strongest evidence available that the steady
 formulation was holding an unsteady flow together by numerical damping.
 
+**A boundary that does work on the fluid.** Mass conservation does not catch this one:
+flux balances exactly while the domain quietly receives more power than anything in it
+could deliver. Two common choices do it.
+
+A `fixedValue` velocity patch with `zeroGradient` pressure is a pump with no stall curve —
+it delivers its flow rate at whatever back pressure the interior develops, so once the
+static pressure at the patch falls below `-0.5|U_patch|²` the sign of its head flips and
+the boundary does unbounded work. Observed: a 3 m/s fixed-velocity fan extracting from a
+2D room held full flow against −53.6 Pa, roughly twice a domestic fan's shutoff, and drove
+the room to 21 m/s mean and 36 m/s peak. Replacing it with `fanPressure` and a
+pressure–flow curve cut the peak to 1.1 m/s. Anything driven by a real device wants that
+device's characteristic, not a velocity.
+
+A `fixedValue` static pressure on an opening that has *inflow* through it is the same
+failure wearing different clothes: it pins static pressure while the incoming air arrives
+carrying kinetic energy, so the total head there is `+0.5|U|²` instead of zero, and all of
+it is free. Measured on a room with a 1 m² opening, that boundary supplied 91 of the 103
+units of mechanical power the room received — about 124 W of air power where the fan
+delivers 5 to 15. `totalPressure` with `p0 = 0` sets `p = p0 − 0.5|U|²` on inflow and pins
+total head to zero, which is what an opening to still air actually does.
+
+The detector is one sum per patch:
+
+```
+Σ_faces (p + 0.5|U|²)(U·n) dA        p kinematic, n outward
+```
+
+A patch with a negative total is giving energy to the fluid, and the sum over all patches
+is the power being fed in. Compare it against what the physical device could plausibly
+deliver. **The asymmetry is the tell**: an opening that is an outlet in one run of a
+matched pair and an inlet in the other misbehaves in only one of them, so a supply/exhaust
+pair disagreeing far more than the geometry suggests is worth budgeting before it is worth
+explaining.
+
+**A steady solve can relax into a state transient integration never reaches.** Distinct
+from the trap above, and it survives converged residuals. The same 2D room gave a
+domain-mean speed of 0.484 m/s under steady SIMPLE against 0.236 m/s transient — a factor
+of two — while the *other* direction of the same matched pair agreed between solvers to
+0.5%. Where the answer being reported is a transient one, verify it transiently, and
+prefer a cold start from rest, which inherits nothing from either solver and so cannot be
+sitting in a basin one of them found and the other does not visit.
+
+## When the picture and the answer say different numbers
+
+Three studies have now shipped a deliverable that contradicted itself, and all three
+failed the same way: the claim and the artefact that was supposed to support it were
+produced by different code, and nothing ever put the two numbers side by side.
+
+**The backward-facing step.** The reattachment length was computed twice, by two
+scripts written in the same session. One walked the wall shear, found sign changes at
+0.21, 6.32, 7.86 and 9.97, and read x_r/h = 6.32 — right; 0.21 is the corner eddy,
+6.32 closes the primary bubble, and it is 4% above Gartling's 6.1. The other, the one
+that drew the delivered figure, read 7.5667 — 24% above the benchmark. The written
+answer quoted 6.4, pointed the reader at the figure, and the figure was annotated
+"reattachment x/h=7.57" with a green line drawn there. Nothing reconciled the three
+numbers. A reader who trusts the picture — which is what a picture is for — came away
+with the wrong one, and both numbers had been printed minutes apart in the same
+session's tool output.
+
+**The ONERA M6 round-1 notes** said the upper-surface contour "shows the classic
+lambda-shock herringbone pattern clearly". It does not. The structure in that image is
+a trailing-edge numerical artefact, on the wrong part of the chord and running the
+wrong way, and only a person looking at the picture caught it. That is the expensive
+version: it turns a clean negative result into a false positive.
+
+**The Tesla-valve geometry** passed its island count and violated every geometric
+clause it had been given — the branch was 60° where shallow was asked for, the return
+ran with the flow instead of against it, the outer radius was 4 mm instead of 6.
+It passed because the report measured none of those three properties, so there was
+nothing for a reviewer to disagree with.
+
+What follows from that, concretely:
+
+- **A figure should carry the number it was drawn from.** `claims.py` stamps it into
+  the PNG as a `tEXt` chunk, where it survives everything that moves the file's bytes
+  around -- fetching it to a laptop, renaming it, mailing it, embedding it in
+  `gallery.html`, whose images are the file's own bytes in base64. It does not survive
+  anything that *redraws* the picture, and the contact sheet redraws every panel, so
+  the sheet carries pixels and no claim. `claims.py check` then puts every claim next
+  to every other claim of the same quantity and next to what the written answer says.
+  A contradiction inside one deliverable is arithmetic, not judgement, and it is cheap
+  to find.
+- **Two numbers only compare if they are in the same units, and a unit nobody measured
+  is worse than no unit at all.** The first version of `reattach.py` stamped "m" onto
+  a number it had no way to know the unit of; `claims.py` will not compare across a
+  unit mismatch, so that one invented word silently switched off the very comparison
+  both files existed for, and the report printed its all-clear over the F-36 pair. A
+  pair that cannot be compared is now printed as not compared. Neither tool guesses a
+  conversion, and neither is allowed to be quiet about declining.
+- **A report of a shape is worth what it measured.** If the brief says shallow, the
+  report says what angle. If it says 6 mm, the report says what radius came out.
+  A property nobody measured cannot be disagreed with, and an unmeasured property is
+  where a wrong answer sits comfortably.
+- **A picture is a claim.** Saying an image shows something is an assertion about the
+  image, and it can be wrong on its own — read the picture again against what would
+  have to be true for the claim to hold (where on the chord, running which way) before
+  writing the sentence.
+
+## Wall shear, reattachment, and the sign you do not have to know
+
+Reattachment and separation are read off the sign changes of the streamwise wall shear
+along the wall. The crossings are the easy part; what to do with four of them is not,
+and it is where the step study lost its number:
+
+- The **first** sign change on a backward-facing step is the corner eddy — the small
+  counter-rotating structure in the step corner, which gives the floor back to the
+  recirculation at around 0.2 h. It is a separation, not the reattachment.
+- The **last** is the downstream end of a secondary bubble, if the wall carries one.
+- The **primary reattachment** is the downstream end of the longest reversed-flow run.
+  That is a rule, not a law: where the downstream separation is the longer one -- a
+  diffuser, a stalled aerofoil with a long trailing bubble -- it names that instead,
+  so a wall carrying more than one bubble is a wall where the rule has to be stated.
+- A bubble still reversed at the last face on the patch has not reattached anywhere the
+  mesh can see, and there is no number to report: the domain is too short for the
+  question.
+
+Which sign of tau means attached flow is a convention, not physics. OpenFOAM's
+`wallShearStress` function object and a hand-computed `nu dU/dy` do not agree about it,
+which is why wrong-signed wall plots keep turning up. You do not have to know it: along
+one wall tau tracks the near-wall velocity up to a single constant sign, so the sign
+relation is measurable off `U` — and which way downstream is comes from the mean
+velocity over the *whole* domain, not off the wall, because a wall truncated before its
+flow reattaches is mostly bubble and anything that asks the wall gets it backwards.
+`reattach.py` does all of that, prints the two naive answers beside the primary one,
+reports the local face spacing as the resolution of the number, and rounds the answer
+to what the wall can actually see. 7.5667 asserts a ten-thousandth of a step height on
+a wall that could not place it better than a face.
+
 ## Reading a mesh's quality
 
 Warn-tier metrics couple to numerics rather than being pass/fail: high non-orthogonality
@@ -263,7 +468,10 @@ the wetted area on the surfaces that matter sits in the wall treatment's valid r
 Grid convergence: Richardson extrapolation presumes monotone convergence, and real triplets
 often do not deliver it. If the sign of the change reverses across three grids, the honest
 output is the spread across the ladder as an interval, labelled oscillatory — not a
-grid-convergence percentage that presumes the thing it is missing.
+grid-convergence percentage that presumes the thing it is missing. It also presumes the
+wall treatment is the same on every member, which snappy's layer erosion quietly breaks —
+measure coverage on each grid before extrapolating across them, and see "Which mesher puts
+layers on a wall" above.
 
 ## Per-class starting points
 
@@ -275,6 +483,7 @@ Solver names are ESI. These are places to start, not defaults to defend.
 | external aero, steady | `simpleFoam` | `kOmegaSST` | ~10D upstream, 20D downstream, 12D sides (an aerofoil wants 50-100c) | vary the schemes; bluff or post-stall bodies are shedding candidates |
 | indoor / buoyant | `buoyantSimpleFoam` | `kEpsilon` | room plus plenum | |
 | transient shedding | `pimpleFoam` | `kOmegaSST` | per class | a short-window check before the long run pays for itself |
+| free surface, moving body | `interFoam` | `kOmegaSST` | tank at model scale, the still-water plane on a cell face | two runs: held, then released. `case_gen.py` writes no `dynamicMeshDict` -- see "When the mesh moves" |
 
 ## When a steady solve will not converge
 
@@ -605,6 +814,181 @@ otherwise arrives when someone looks at the result and asks for "the transient o
 transient run (pimpleFoam) costs more but is the honest instrument for a shedding flow;
 a steady run is right for an attached, genuinely steady one.
 
+## When the mesh moves
+
+A moving mesh is a second solver underneath the flow solver, with its own dictionary and
+its own failure modes, and it is coupled tightly enough that the wall conditions, the
+fields and the function objects all have to agree with the mesh type before anything
+runs. What follows begins with one case class -- a mesh that morphs, with no topology
+change -- written down because it cost four rounds of divergence to get once: a 3 m
+Wigley hull towed at Fr 0.316 and then released in heave and pitch, `interFoam` with
+`dynamicMotionSolverFvMesh` and `sixDoFRigidBodyMotion`, 8 s of physical time in two
+phases, one attempt each and no restarts, settling at 6.19 +/- 0.35 mm of sinkage
+against the towing tank's 7.50 mm.
+
+**Settling and then releasing is two runs, not a switch.** `sixDoFRigidBodyMotion` reads
+its constraints once at start-up and has no time-varying form of them, so a body that is
+held for the start-up transient and freed afterwards is two cases: phase one with
+`dynamicFvMesh staticFvMesh` and the body fixed, run until the flow field is developed,
+then a restart from `latestTime` with `dynamicMeshDict` switched to
+`dynamicMotionSolverFvMesh`. Nothing moved during phase one, so the mesh the second phase
+inherits is the mesh it was built with.
+
+**The mesh type decides three other files with it.** Under `staticFvMesh` the body wall is
+`noSlip` and `0/pointDisplacement` is never read. With the motion solver active the wall
+is `movingWallVelocity` and `pointDisplacement` has to be there. Function objects go the
+same way: `sixDoFRigidBodyState` wants a live motion solver and is an error under
+`staticFvMesh`, so one `controlDict` cannot serve both phases. On the hull above, the
+wall condition on binary restart fields was switched with `changeDictionary` rather than
+by rewriting them.
+
+**`sixDoFRigidBodyState.dat` reports absolute positions, and angles in radians** unless
+`angleFormat` is set to degrees. Heave is that column minus the centre of rotation's
+starting z, which is a subtraction that is easy to skip and impossible to see afterwards
+in a plot that looks plausible with or without it.
+
+**The datum is a measurement.** `setFields`' `boxToCell` fills every cell whose centre is
+below the plane, and on a graded tank mesh that over-fills the domain and leaves the
+ambient free surface sitting above it -- about 24 mm above z = 0 on one 304k-cell case,
+agreed to a millimetre by an `alpha = 0.5` isosurface, the far-field bottom `p_rgh`, and
+the volume bookkeeping. Sinkage quoted against the design draught instead of against that
+measured rest float came out as the hull *rising* 18.2 mm, and two rounds went into the
+mesh before anyone measured where the water actually was.
+
+**Morphing amplifies what the mesh already had.** A motion solver that morphs the whole
+domain around a body turns cells that were merely concave into negative-volume cells once
+the amplitude grows, so a run that started clean fails some seconds in. The cheap half of
+that is `checkMesh` on the mesh as meshed, before any body is released; the other half is
+that a displacement growing steadily with no bound is more often a force imbalance than a
+mesh defect, and the two read alike in the log. `ladder.py` puts the cheap half first on
+the rotating-machinery ladder: move the points through a full cycle with no flow solved
+at all and count the volumes, which is the one moving-mesh check whose answer is known
+before it runs.
+
+**Where the templates are.** Three `constant/dynamicMeshDict` files are attested on this
+image by path: `$FOAM_TUTORIALS/multiphase/interFoam/RAS/DTCHullMoving`,
+`$FOAM_TUTORIALS/multiphase/interFoam/RAS/floatingObject`, and
+`$FOAM_TUTORIALS/incompressible/pimpleFoam/RAS/propeller`. Taking DTCHullMoving's
+structure *wholesale* is what ended the divergence on the hull above, on the first
+attempt: internal field at tow speed from t = 0 with no inlet ramp, an outlet of
+`outletPhaseMeanVelocity` plus `variableHeightFlowRate` on the phase fraction,
+`pressureInletOutletVelocity`/`totalPressure` on the atmosphere, `fixedFluxPressure` on
+the hull, the tutorial's own alpha solver block, `setFields` with both `boxToCell` and
+`boxToFace`, and `renumberMesh -overwrite` ahead of the solver. Four earlier rounds had
+adopted parts of it and died at the same t ~ 0.106 s each time.
+
+`case_gen.py` dresses a mesh that exists and writes no `constant/dynamicMeshDict`, no
+`0/pointDisplacement` and no `constant/MRFProperties`; its `--study` values are mesh,
+steady and transient. So a moving-mesh case here is a tutorial copied and edited, which
+is also the conclusion the hull session reached on its own before it went to
+DTCHullMoving.
+
+**Zones are what AMI, MRF and overset are named against.** A sliding interface, a frozen
+rotor and an overset region all point at a `cellZone` or a `faceZone` by name, and a
+dictionary that names a zone the mesh does not have fails at the first solver step.
+`mesh_look.py` reports the zones it finds in `constant/polyMesh/{cellZones,faceZones}`
+next to the patch table -- names and counts either format, and a cell zone's bounding box
+and centroid where the file is ascii -- so a zone can be checked for before a dictionary
+is written against it. A mesh with no zone files reports none, which is the state of most
+meshes here.
+
+**What is on PATH is a question rather than a fact.** `interFoam` running a
+`dynamicMotionSolverFvMesh` case is attested on this image. The tutorial trees for
+`moveDynamicMesh`, the `over*DyMFoam` overset family, and `topoSet`/`setsToZones` are
+here too, which is strong evidence and not the same thing as the executable being on
+PATH. One `which` settles it in a second, and it is worth the second: on this image
+`which MRFSimpleFoam simpleFoam` came back with only `simpleFoam`, because MRF in v2512
+is an `MRFProperties`/`fvOptions` feature of the ordinary solvers and not a binary of its
+own.
+
+Two more moving-mesh cases have been paid for since the hull, and they cost different
+things: a 2D circular-Couette annulus cut in half by a `cyclicAMI` sliding interface, and
+a cylinder on a spring free to move across the stream at Re = 100 on a morphing mesh.
+Both are kept as prompts and a grader under `benchmarks/moving_mesh/`, so what follows is
+reproducible rather than remembered.
+
+**The refinement that diverged was limited by `nu*dt/dr^2`, not by the Courant number.**
+The annulus's grid ladder doubled the radial cells and left `deltaT` at 0.005 with
+`adjustTimeStep no`, and both members ran away to 2--3 m/s against a wall speed of 0.04.
+The Courant number looked like the culprit, peaking at 234, and it was not: the conformal
+control with no interface in it diverged identically, so the AMI pair was never
+implicated; `checkMesh` passed on every mesh (a polar `blockMesh` is essentially perfect,
+3.5e-6 degrees of non-orthogonality); and upwinding the convection term, dropping the
+non-orthogonal correction, and initialising with the exact field each left it diverging.
+One variable at a time on the same mesh found the parameter that separates the runs that
+live from the runs that die: the **cell diffusion number `D = nu*dt/dr^2`**, which is the
+pressure--velocity splitting error of an implicit step whose transport is all diffusion.
+On this case's original two outer and two inner correctors, D = 3.1 is stable and D = 6.25
+and D = 12.5 both diverge. `nCorrectors 4` inside the same two outer correctors carried
+every level of the ladder, to D = 11.5, for about 20% more per step; under-relaxation also
+stabilises it and was rejected for slowing the approach to the steady state by orders of
+magnitude, still 7.4% off after 6 s of run. The trap underneath is that holding the
+Courant number fixed under refinement means `dt ~ h`, which *doubles* D at every level, so
+a numerics setting that carried the base mesh cannot carry that mesh's own grid study --
+the third level of this ladder reaches D = 5.8 on settings good to 3.1. The extra
+correctors buy stability and not a different answer: the same mesh at D = 12.5 with four
+correctors and at D = 3.1 with the cheap numerics reach the same torque to 4e-4 relative.
+
+**A sliding interface's error is first order in the angular slide per step, so refining
+the mesh at a fixed time step buys almost nothing.** Three meshes per flavour at 2,880,
+11,520 and 46,080 cells, `dt` scaled with the cell size so the Courant number is 0.255
+throughout: the conformal control converges at observed order 1.93 and Richardson
+extrapolates to within +0.0004% of the closed-form torque, GCI 0.0136% on the fine mesh;
+the same annulus with a `cyclicAMI` pair through it converges at 0.79, which is first
+order, and extrapolates to -0.0646%, GCI 0.3557%. The experiment that separates the two
+causes holds `dt` and moves only the cells: at `dt = 0.0025 s`, going from 11,520 to
+46,080 cells moves the inner-wall torque error from +0.2174% to +0.2205% and the imbalance
+from -0.5415% to -0.4539%. Four times the cells, nothing bought. What the interface error
+scales with is `omega*dt`, how far the rotor slides past the stator in one step, and a
+second-order `ddt` scheme does not remove it. A ladder that refines space and time
+together therefore reads as clean first-order convergence while the time step is doing all
+of the work, and a sliding-interface number means something at a stated `omega*dt` rather
+than at a stated cell count.
+
+**The interface's own health check passes a case whose torque is a percent wrong.** The
+standard check on a `cyclicAMI` pair, and the one a rotating-machinery engineer runs, is
+the solver's printed `AMI: Patch source/target sum(weights)`: it measures whether the
+interface kept its **area**. On the graded annulus it was immaculate -- min 1.0, max
+1.0000428 over 4,076 rebuilds, 43 ppm from unity, source and target identical on every
+line. The torque was not. In steady circular Couette the torques on the two walls are
+equal and opposite exactly, because angular momentum is conserved; it is an identity and
+needs no publication behind it. The two walls disagreed by **0.911% of the inner reading**
+against the same annulus meshed conformally at the same 50 x 240 resolution, which
+balanced to **0.011%** -- 85 times smaller, and with the opposite sign, so it is a
+different error rather than the same one smaller. The inner-wall torque itself was +0.43%
+off the closed form. Area conserved, torque not, and the check that says so costs nothing:
+both walls already carry a `forces` function object and the difference between them has a
+known exact value of zero. It also behaves like the interface rather than like the mesh --
+-1.80%, -0.91%, -0.45% down the ladder at observed order 1.00, against the control's
++0.033%, +0.011%, +0.0030% at 1.65 and then 1.84. A conserved quantity whose exact value
+is zero is the cheapest instrument any case has, because it needs no reference, no grid
+study and no second run.
+
+**A body free to move can settle on an amplitude the coupling scheme is holding it at.**
+The VIV case was graded in two stages and the first one is a gate, for the reason the hull
+above is two runs: the same mesh with the cylinder held fixed gave St = 0.166141 against
+Williamson's 0.164, +1.31%, with mean C_D 1.3555 and C_L rms 0.2467 both inside their
+published bands, and halving `deltaT` moved St by 0.13%, so the offset is not temporal
+resolution and 2.5% blockage is the plausible home for it. Released loosely coupled -- the
+mesh moved once per step on the previous step's force, `accelerationRelaxation 0.7` -- the
+cylinder settled at A/D = 0.640, and by every conventional test it was finished:
+stationary to the fourth decimal over 15 cycles, one clean spectral line, sinusoidal to
+0.02% (half peak-to-peak and sqrt(2) x rms agreeing to 2e-4), and the forces reproducible
+offline digit for digit by `pimpleFoam -postProcess`. With zero structural damping nothing
+can dissipate energy, so a real limit cycle takes zero net fluid work per cycle.
+Integrating `F_y v_y` over each whole cycle gave **-10.1% to -10.4%** of the body's
+mechanical energy per cycle while that energy held constant to 0.1%, which is impossible,
+and the partitioned coupling is the only candidate supplier. Restarted with the body
+inside the PIMPLE loop -- `moveMeshOuterCorrectors yes`, three outer correctors,
+`accelerationRelaxation 1.0` -- the amplitude decayed monotonically through 0.626, 0.603,
+0.589, 0.580, 0.574 and flattened at **0.567**, where the work per cycle is +0.04% to
++0.18%. A second and independent route agrees to 1%: the work per cycle through the ring-up
+is positive at small amplitude and crosses zero at A/D ~ 0.572, bracketed by measured
+cycles at 0.576 and 0.624. **Loose coupling over-predicted the amplitude by 13% and no
+residual, no spectrum and no stationarity test saw it**; the energy balance is what the
+published 0.567 rests on, and it is qualified by the run itself as a twelve-cycle
+continuation decaying from above rather than an independent ring-up from rest.
+
 ## Choosing a solver class from the deliverable
 
 Steady or transient is one axis. Pressure-based or density-based is a second one, and it
@@ -767,6 +1151,25 @@ that the shape is the one that was meant and that the inlet is the end it should
 the all-hex confirmation. A geometry is authored whole and looked at, which is a
 different kind of task from the ladder above: its rungs are physics that a reduced case
 can answer one at a time, while a shape is right or wrong as a picture and a few numbers.
+
+Two more gotchas belong next to that recipe, both found the hard way -- run to
+failure on the real instance, not read off documentation -- and both baked into
+`toolbox/templates/duct2d.py` and `toolbox/templates/body_in_box.py`, which run the
+whole recipe end to end rather than describe it. First: every OpenFOAM utility, not
+just solvers, constructs a `Foam::Time` before it touches anything, so `gmshToFoam`
+run in a directory that has nothing but a `.msh` in it fails "cannot find file
+.../system/controlDict"; there is no mesh-only exemption. A minimal `controlDict`
+has to exist before `gmshToFoam` runs, not after -- and `checkMesh` asks for more
+than that: it builds an `fvMesh`, not just a `polyMesh` (its non-orthogonality and
+skewness metrics are computed with the interpolation weights `fvSchemes` sets), so it
+fails on a missing `system/fvSchemes` even once `gmshToFoam` has already succeeded on
+`controlDict` alone; `fvSolution` follows for free since nothing at this stage reads
+it. All three are stubs, not a real case -- enough to parse, nothing solved. Second:
+`constant/polyMesh/boundary` is a bare list, not a named dictionary, so
+`foamDictionary` addresses the whole thing as one pseudo-entry it calls `entry0` --
+`foamDictionary constant/polyMesh/boundary -entry wall_bottom.type -set wall` fails
+with "not found in dictionary", and the patch has to be reached through that wrapper,
+`-entry entry0.wall_bottom.type -set wall`.
 
 ## Files the person sends up, and PDFs in particular
 

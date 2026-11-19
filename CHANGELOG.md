@@ -6,6 +6,827 @@ All notable changes to this project are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-18
+
+### Changed
+
+- **Signing in with no model key of its own uses Reynolds' model.** A machine with no
+  provider, model, endpoint or model key chosen (any vendor's key variable counts), is set to
+  the `reynolds` preset at `openreynolds login`, metered to the account, and is told
+  how to switch to its own key. A machine that has a key or chose a provider keeps it,
+  and is now told `openreynolds config --provider reynolds` is the other way.
+
+### Fixed
+
+- **`openreynolds login --browser` waits through a brief outage.** A 5xx, a 429 or a
+  dropped connection while the code waited for approval ended the sign-in, so the
+  page then said no terminal was waiting for the code. It now keeps asking until the
+  code is approved, refused or expired, and says when the service stopped answering. A
+  429 doubles the wait between polls. A key the service handed over on a reply that was
+  lost is named as that, with where to revoke it.
+
+## [0.4.1] - 2026-11-17
+
+### Added
+
+- **`openreynolds logout`.** Revokes this machine's service key on the service, then
+  removes it from the config and deletes any traces queued to share, unsent. If the
+  service cannot be reached nothing changes, unless `--here-only` says to remove the
+  key from this machine anyway. A key set in `FOAMD_API_KEY` is left alone, and the
+  command says the machine is still signed in through it.
+
+### Fixed
+
+- The release workflow now creates the GitHub release for a tag. It read the tag from
+  a job it did not wait on, got nothing, and took the latest release for this one.
+  An empty tag now fails the job.
+
+## [0.4.0] - 2026-11-17
+
+### Added
+
+- **A workspace on your own machine: `--local`.** The hosted workspace's image
+  (`ghcr.io/inviscidai/reynolds-workspace:2512`: OpenFOAM ESI v2512, HiSA, gmsh,
+  build123d, pyvista) runs in Docker here, with `~/.openreynolds/work` mounted as
+  `/work`, as your user and with no network. No account is needed, only a model key;
+  `--study <id> --local` resumes a local study, and jobs outlive the session.
+  `OPENREYNOLDS_LOCAL=native` uses an OpenFOAM installed on the machine instead, with
+  no sandbox, and now says so at the start when it finds none. Felix stays cloud-only.
+- **`openreynolds mcp`: Reynolds as an MCP server.** Claude Code or any MCP client can
+  start studies, watch them, answer their questions and fetch their results through
+  the same nine tools the hosted Reynolds MCP server offers (`openreynolds/mcp/core.py`
+  defines them for both). Studies run in this process, on a Reynolds workspace or with
+  `--local` on this machine's Docker. `claude mcp add reynolds -- openreynolds mcp`. The
+  `mcp` package is now a standard dependency, so it works from pip, uvx, pipx and npm
+  installs alike; the `[mcp]` extra is kept, empty, for older instructions.
+- **A signed-in machine shares a trace of each study.** While OpenReynolds is signed in
+  (`openreynolds login`), it sends the service a trace of each study after it ends --
+  usage (tools and whether they worked, models, tokens, timings, workspace kind and
+  solver, OS and versions) and study content (messages, reasoning, tool inputs and
+  outputs, each cut at 20,000 characters) -- whether the workspace is the service's or
+  this machine's. Credentials it knows, environment variables named like secrets and
+  the shapes of common keys are removed before a trace is queued (`redact.py`), and
+  again by the service. It says so in one line at sign-in (password or `--browser`),
+  or at the next study on a machine signed in before. `openreynolds sharing
+  off|on|status` and `OPENREYNOLDS_SHARING=off` switch it per machine, and `off`
+  discards the queue; nothing is recorded or sent without a service key. Traces can be
+  deleted from the web app's Account page. `doctor` shows whether sharing is on. What
+  is kept and for how long: https://tryreynolds.com/privacy.
+- **A new hosted study gets its own workspace (#92).** Studies no longer share one
+  instance's `/work`; a resumed study goes back to its own.
+
+- **A study's spending ceiling is the person's question.** When the hosted service
+  pauses a study at 80% of its ceiling (`409 study_paused`), on a workspace call or on
+  a model call, the person is asked in any mode: yes doubles the ceiling (`POST
+  /v1/studies/{id}/cap`) and the paused call runs again, no stops the study with a
+  final message and asks the model nothing more. Before the first solve the person is
+  told how far the study may go before it asks; in ask-before-compute mode that is
+  part of the job's question. See docs/modes.md.
+
+- **Felix mode: a second solver.** `--solver auto|openfoam|felix` (or
+  `OPENREYNOLDS_SOLVER`). With `auto`, the default, the solver is chosen from the
+  person's first message by a request of its own, before the agent's first turn (see
+  *Changed*), and the workspace -- of that solver's kind -- is reserved and started,
+  and the platform's study opened with that solver, only once it has been chosen. A Felix study gets its own system prompt (pointing at `/opt/felix/docs`), no
+  `cad`, `mesh_review` or OpenFOAM toolbox, and a `job_start` that runs `felix run`
+  without the OpenFOAM restart guard and trapFpe check. The solver is fixed for the
+  whole study and recorded in `session.json`; a resume keeps it. The OpenFOAM prompt
+  is unchanged byte for byte.
+
+### Changed
+
+- The `openai-responses` preset defaults to `gpt-6.1-sol`, not `gpt-5.6-sol`, and compacts before
+  272K tokens. `gpt-5.6-sol`'s promotional price ends in November 2026, and on the CAD desk
+  `gpt-6.1-sol` had 22 of 26 cases survive the mesh vet against 16 of 26. A model set in your
+  config stays as it is.
+- **A study's pause speaks in normal studies, never dollars.** Plans are sold as
+  studies, so what a study has used is said as a multiple of a normal one (200 cents
+  quick, 500 full, the service's `times_normal`), and no hosted cost reaches the
+  person anywhere: the pause asks "This study has used 2x the usage of a normal full
+  study. Do you want to continue?", yes doubles the ceiling (a typed dollar amount is
+  no longer an answer), and the stop message, the notice after a raise, the line
+  before the first solve and a paused error's text all speak in multiples. The
+  default ceilings are the service's new 500 and 1250 cents. `job_start` no longer
+  takes `estimate_usd`, the Felix status line no longer shows `cost_usd`, and both
+  prompts say no cost in money is told to the user.
+
+- **The service's pricing errors keep their fields.** `BackendError.extra` (and a
+  model call's `ProviderError.body`) carry everything a 4xx body says beyond `error`
+  and `message` -- the tier and `upgrade_to` of a 403 `plan_limit`, the period and
+  overage of a 402 `allowance_exhausted`, the spend and ceiling of a 409
+  `study_paused` -- and the error's text names the plan and the tier to upgrade to.
+  A spent allowance names a renewal day only from the 402's `renews_at`, so a work
+  trial, a plan set to cancel and a past-due account are no longer told it renews
+  (an older service without `renews_at` falls back to a `period_end` still ahead);
+  the postpaid mode is called pay-as-you-go overage and the prepaid one credits.
+
+- **Workspace calls name their study.** Once a session knows its study, every call
+  to the hosted service carries `X-Study-Id` -- sandbox start, exec, files and jobs, a
+  Felix solve's job among them -- so the service tags that spend to the study and its
+  pause is exact; a resumed study names itself on the start too. A raise of the
+  ceiling the service answers `paused: true` (its own count still past 80%) is asked
+  again at once instead of retrying the paused call. The Felix prompt and `job_start`
+  name `402 allowance_exhausted`, `403 plan_limit` and `409 study_paused`, and a
+  model call refused with `allowance_exhausted` or `plan_limit` says what that means
+  (`budget_exhausted`, from an older service, still blocks as a 402).
+
+- **A session's system prompt and tool list no longer change mid-conversation.** A study
+  whose solver is `auto` used to start the agent on a solver-choosing prompt with only
+  `choose_solver`, and swap both once it was called; through the service's Bedrock
+  proxy the next request was a 400 (a thinking block is bound to the prompt and tools
+  it was made under) and the turn ended with nothing said. The solver is now chosen
+  from the person's first message by a request of its own, before the agent's first
+  turn (`desk.route`); the agent starts on that solver's prompt and tools, and the
+  choice and its reason are told to the person and in the briefing. A routing request
+  that fails leaves the study on OpenFOAM, said so. `choose_solver`,
+  `SOLVER_CHOICE_PROMPT` and the swap are gone.
+- **`/btw <question>` is a side question.** Answered by a fork of the agent's last
+  request -- same model, prompt, tools, settings and messages, one message appended, so
+  it reads the conversation from the prompt cache -- and never added to the
+  conversation. It may run `read_file`, a non-waiting `job_check` and `send_to_agent`,
+  which passes the person's own words to the agent at its next step; any other call is
+  not run. `send_to_agent` is in every tool list for that reason. Bare `/btw` is still
+  `/status`; the "By the way, no need to stop" framing is gone.
+- **The front desk is gone.** Nothing answers a mid-turn message in the agent's place.
+  A message typed mid-turn gets a receipt at once (queued, what the agent is doing and
+  for how long, `/btw` for a side question), held waits ask after the person every
+  second rather than every five, and the "what's happening now" line is built from the
+  tracker's job facts with no model call. `desk_model` is still read and switched, for
+  the configurations and the hosted app that set it.
+- **`/mode` no longer changes the tool list.** `checkpoint` is in every mode's list and
+  answers outside structured mode that checkpoints are structured mode's; the switch
+  reaches the model as a harness note, as it already did. The system prompt never
+  carried the mode. Structured mode still holds `job_start` until a plan is approved.
+- **Reasoning blocks follow what they are bound to.** Measured with the binding checked
+  strictly: a thinking block is bound to the system prompt, the tools and the messages
+  before it (an edited earlier message is the same 400; effort and model changes are
+  not). Image eviction and `drop_images` rewrite an earlier message, so the turns after
+  it lose their thinking blocks; a `/model` switch that rebuilds the client strips them
+  even when the model id is unchanged.
+- **A failed model request is in the transcript.** A turn a provider error ended leaves
+  an `event` row saying the request failed and why, not only a live notice.
+
+### Fixed
+
+- **End stops the workspace before bundling the case (#93),** and the bundle stops at
+  its budget; a bundle over budget keeps the record in part instead of dropping it
+  (#95).
+- **A SOCKS proxy can start the model client (#90).** `httpx2[socks]` is a dependency.
+- **A live study's times reach the viewer within a cycle (#98),** the newest first,
+  before the backfill of earlier ones (#102).
+- **Every model client a session builds names the study (#105),** so the service can
+  count its usage against that study.
+- **A cut stream is retried, and a transient model failure no longer ends the turn
+  (#87, #74).**
+- **Ending a session keeps a job's real ending (#85),** and a workspace start that fails
+  says so (#83).
+- **The solver-could-not-be-chosen line is printed once,** not twice, in a plain session.
+- **The `--no-capture` help said it sends nothing to the platform.** It keeps the
+  study's transcript on this machine; traces have their own switch. The help, README
+  and `doctor` now say so.
+- **The trial text in `login` and the README said a company address needs no card.**
+  Both trials take a card and renew unless cancelled.
+- **The end-of-session hint offered `openreynolds pull --all`,** a flag that does not
+  exist; it is `openreynolds pull`, and a local study is not offered it at all. A
+  session on a native local workspace no longer says it joined a running workspace.
+- **The MCP server reported an empty version;** it reports the package's.
+
+- **A piped command fails when any stage of it does (#48).** `blockMesh | tail -40`
+  reported exit_code 0 from a FOAM FATAL ERROR because `tail` succeeded. `bash` and
+  `job_start` now run a command that has a pipe in it under `set -o pipefail`; one
+  without a pipe goes as written. The cost is SIGPIPE: a stage cut off by `head` or
+  `grep -q` now exits 141, so `if cat long.log | grep -q OK` can take its else branch.
+  The tool descriptions say so, and `bash` and `job_check` say what a 141 from a piped
+  command is.
+
+- **End copies the study to durable storage before saying its files are kept (#51).** A
+  hosted End leaves the workspace up for the reaper, and the service copied a workspace
+  to S3 only while jobs ran and when it was stopped, so a report written in the last
+  turn sat on the volume alone for minutes. End now asks the service to copy the study's
+  own directory (`POST /v1/instances/{id}/checkpoint`) and waits up to 90 s. It records
+  the copy's `taken_at` and manifest in `session.json` under `checkpoint`. A copy that
+  fails or times out is said plainly and recorded as an `error`, never assumed.
+
+## [0.3.2] - 2026-10-05
+
+### Fixed
+
+- **Patch-normal measurement keeps the PyVista surface extractor it was measured
+  with.** PyVista 0.49 warns that `extract_surface()` will change its default from
+  `dataset_surface` to automatic selection, which chooses a different algorithm for
+  most inputs. The patch table relies on stable face ordering to compute a mean normal,
+  so it now selects `dataset_surface` explicitly instead of changing with a dependency
+  update. This also removes the repeated warning from the toolbox tests. The `algorithm`
+  keyword is new in PyVista 0.47, so that is now the floor. (#46)
+- **A `bash` command the workspace moved to a job no longer comes back as `exit_code:
+  0`; the call waits the job out for the rest of its `timeout_s`, and a command still
+  running when that is up says so in its first line.** The hosted service caps a
+  synchronous exec at 120 s (`FOAMD_SYNC_EXEC_MAX_S`); a command still running there,
+  whose caller asked for longer, is started again from scratch as a detached job and the
+  answer is `{exit_code: null, promoted: true, job_id, output, note}`
+  (`OpenFoam_Instance/app/execs.py`, `spec/openapi.yaml`). `HostedBackend.exec` turned
+  that into `ExecResult(exit_code=0, output=note, job_id=...)`, and `_bash` printed the
+  zero first and the note about the job second. Measured in production on 2026-09-21
+  (study 20260921-033019-e1b4, workspace 35c9f018): `bash sleep 240; ls -R .../mesh |
+  head -40` at 03:37:36, `bash sleep 200; ... grep "^Time =" log.pisoFoam | tail -1` at
+  03:48:23 and `bash sleep 180; ... tail -3 log.recon` at 04:04:22, each asked with
+  `timeout_s=300`, each answered after the 120 s window, and each transcript row reads
+  `-> exit_code: 0` for a command that was still running (jobs 808edf10, 5432459d,
+  e839ac57). The model read three commands that had finished with no output: it
+  `job_check`ed the first once, two seconds in (a wait answered at 0 s by the put-back
+  line #41 fixed), and none of them again, and paced the rest of the study with `bash
+  sleep` calls of 60-115 s. Nothing on the control plane read the jobs either -- a row was only
+  reconciled by a `GET /jobs/{id}` or by the reaper once the workspace had gone idle --
+  so the three rows read `running` for 46, 35 and 20 minutes after their commands had
+  ended, until the 04:27 sweep closed them off the store. foamd #55 fixed the service's
+  half (the promoted job is watched and its row closed with the real exit code); this is
+  the agent's. `ExecResult` carries the truth: `exit_code=None`, a new `promoted` flag,
+  `job_id`, and `output` as what the synchronous run had produced (empty from today's
+  service; carried in case that changes), with the wrapper's `stderr` through -- never
+  `exit_code=0`. `EXEC_SYNC_WINDOW_S = 120` joins `EXEC_MAX_TIMEOUT_S` on the protocol,
+  because the tool states the number to the model. `_bash` on a promoted answer records
+  the job as the session's (`store.record_job`, the way `job_start` does) and follows it
+  for what is left of the caller's own `timeout_s` -- the same held wait `job_check
+  wait_s` makes (`_hold`, now the one loop behind both), ended by the same things: the
+  job ending, the time running out, the person writing (`ToolContext.on_wait_input`,
+  #41) or leaving (`on_leaving`, #43). A job that ends in time is the command's result:
+  `exit_code: <the job's>` first, a note naming the job and the two spans (`moved to
+  job <id> at 120s ... waited 130s more`), the job's status line and its log as the
+  output. One still running when the time is up, or when the wait was cut, leads with
+  the fact -- `still running as job <id> (promoted after 120 s; 180 s waited)` -- then
+  the mechanism, `job_check <id>` as what follows it and "not a command to run again",
+  the wait's own note when the person wrote or left (the written one says `job_check`,
+  not "call bash again": `bash` again would run the command a third time), the job's
+  status line and the log so far. Never `exit_code: 0`. The record's `log_offset` is
+  where this left the log, so the model's `job_check <id>` continues rather than
+  repeats; a job handed back still running stays `running` in the record, so the watch
+  loop polls it and wakes the model when it ends -- the poll that never happened. A
+  status or log that could not be read is a note under the first line, which stands.
+  The `bash` description says that a command still running at 120 s may become a job
+  the call waits on and what the two answers look like, as a fact about the workspace
+  (the local backend never promotes: it runs a command to its `timeout_s`, and nothing
+  there changed). The mesh desk's step observation, which asked for 240 s and read the
+  same shape, says `no exit code yet: running as job <id>` where it would now have said
+  `exit None`. Unchanged: a `timeout_s` at or under 120 (the service never promotes
+  it), `-1` and its note, truncation, `[took Ns]`, the workspace `stderr` note, `idle`.
+  Tests: the hosted backend on the service's promoted answer (direct, through the
+  edge's 303, with `stderr` and output through, the other three shapes untouched);
+  `_bash` with `timeout_s=300` on a promotion under a hand-turned clock -- the job ends
+  with rc 0 and a log (`exit_code: 0`, the log, the job named, `[took 130s]`, the record
+  closed), ends with rc 1 (`exit_code: 1`), outlives the caller's timeout (the first
+  line, `job_check <id>`, the log so far, exactly 300 s held, the record left running),
+  is cut by the person writing and by the person leaving (the same notes the other waits
+  carry), has no time left after the exec, cannot be read; the first run's output kept
+  apart from the job's log; a `timeout_s` within the window byte-identical to before;
+  the description's words and register.
+- **The workspace is listed by the service, running or stopped; the `find` over the
+  exec channel is the fallback, and a cut output can no longer invent a file.**
+  `Browser.tree` listed a workspace with `find ... | sort | cut | head -n 4001` over
+  the exec channel, and the hosted workspace's daemon caps a command's output at 64 KB
+  and cuts it mid-line (`OpenFoam_Instance/daemon/settings.py` `EXEC_OUTPUT_CAP_BYTES`,
+  `daemon/runner.py` `out[:cap]`; the answer carries `truncated: true`, which
+  `HostedBackend.exec` mapped onto `ExecResult.truncated` and `Browser.tree` ignored).
+  Measured in production on 2026-09-21 (study 20260921-033356-076b, workspace
+  35c9f018): the listing is ~1,532 rows at ~83 bytes each, ~127 KB, against the 64 KB
+  cap -- so the 4,000-entry cap never bound anything, the byte cap did, at ~850 rows.
+  The partial last row, `f\t1528155\t<mtime>\t/work/20260921-033356-076b` -- the row
+  for `mesh/zoom.png`, 1,528,155 bytes, cut right after the study id -- has four
+  well-formed fields, and `_parse` accepted it: an `Entry` with that path,
+  `is_dir: False` and `size: 1.5 MB` -- a file at the study root. Everything that
+  followed was measured too: the page's tree collapsed to one unexpandable "remote
+  1.5M" leaf (ui #31 now hardens the page); the mirror asked the service to archive
+  that "file" every cycle (`tar?mode=pack&paths=/work/20260921-033356-076b` -> 502/504
+  each 20 s from 04:07 to 04:16), plus 404s for the other paths a cut produced (`/r`,
+  `/run/processor`, `/run/p`); and the live tree during a run held ~850 of the
+  study's 1,532 rows -- since #36 the order is breadth-first, so the cut lands in
+  `run/processors4/<time>/`, but everything past it was invisible to the live pane and
+  to the mirror until the workspace was stopped. Meanwhile #38/#39 had given the
+  hosted backend `list_stored` -- `GET /v1/instances/{id}/files?list=1`, recursive,
+  5,000 entries -- which lists any path under `/work` from the live daemon while the
+  workspace is up and from the service's copy once it is stopped, breadth-first,
+  capped at 5,000 with its own `truncated`, never starting a machine and never
+  counting as use of one (foamd #53) -- and `Browser.tree` used it only when a poll
+  said the workspace was idle. Now `tree()` asks `list_stored` first, whatever state
+  the workspace is in and whether or not the call is a background poll; the answer is
+  the listing, cut to the depth and to 4,000 entries breadth-first, the service's
+  `truncated` carried. No `find`, no exec channel, no byte cap, no partial line, and
+  one path for both states. The walk runs only when `list_stored` answers None -- a
+  local backend, a workspace still coming up (`PendingBackend.list_stored` is None
+  until the machine is there, and the walk then waits for it as every call did), a
+  service without the route, a failed request -- and then exactly as before: a poll,
+  then work only when nothing is running and somebody is asking; a background walk
+  that finds nothing running still raises `workspace_idle` and starts nothing. The
+  walk itself is made safe for the local backend and for the fallback: when the
+  backend says the output was cut, the tail after the last newline is dropped
+  unparsed, and the listing is marked truncated with a notice that names the output
+  cap (a listing of 850 rows told it was "capped at 4,000 entries" would contradict
+  what is in front of the reader); and `_parse` refuses a row whose path is the
+  listed root or is not under it -- the walk is `-mindepth 1`, so such a row can only
+  be a cut or noise. The listing request is bounded at 60 s, the minute the `find`
+  had (`FoamdClient.request` with no timeout is no timeout at all, and the mirror
+  asks this every twenty seconds). The route's `mtime` are whole seconds where
+  `find`'s carried a fraction; `Entry.mtime` stays a float and nothing that reads it
+  is finer than two machines' clocks. Behaviour changed for the background cycles of
+  a session whose workspace is stopped: they now read the service's copy each cycle
+  -- one bounded request, nothing started, nothing pulled when nothing has changed --
+  where before they waited out the idle workspace. Unchanged: a backend without
+  `list_stored` (a test's, an embedder's) lists as it always did; the 4,000-entry cap
+  and its notice; the poll-first order of the walk.
+- **End pressed mid-turn ends the turn at its next safe point, then the session -- the
+  way a Stop button is expected to work.** The web's End button sends `/exit` into the
+  session's inbox (the runner's `relay.py`); typed, `/exit` and `/quit` are the same
+  command, and an EOF (the interface's ctrl+C, a closed stdin) is the same leaving. Met
+  by the loop's drain between tool calls (`cli._typed_while_working`), all of them were
+  put back for whoever waits at the prompt -- and honoured there, when the turn ended on
+  its own. In production on 2026-09-21 (study 20260921-033019-e1b4) the person pressed
+  End at 03:33:40 into a turn that was waiting on the mesh desk; the turn went on for
+  another thirty-seven minutes (to 04:10:46: eighteen `bash sleep 60..240` calls, eight
+  held waits, a fifteen-minute `pisoFoam` solve on four ranks launched at 03:44:36, a
+  reconstruction, a 300-frame animation and a gif, all for a person who had left) and
+  the session ended 27 s after the turn did, at 04:11:13. (#41 fixed what the put-back
+  line did to the waits in that same turn -- `mesh_wait` and `job_check` answering at
+  0 s with nothing to deliver -- and deliberately left the End semantics for this
+  item.) Now the drain tells the loop (`Loop.leave`) when what it meets is a `/exit`, a
+  `/quit` or an EOF, and still puts the line back as before; from then on the turn ends
+  at its next safe point. A held `job_check` or `mesh_wait` asks the loop a second
+  question beside "did the person write?" (`ToolContext.on_leaving`, wired to
+  `Loop.leaving`) and returns within a poll: `[waited 12s] [the person ended the
+  session, so this answered early; the session is closing down]`. A call already
+  running when End was pressed -- a `bash` command, a `job_start` -- is not cut: each is
+  bounded by its own deadline, and its result is recorded when it comes back. A call the
+  model asked for in the same batch that had not started is not started, and is answered
+  `This call did not run: the person ended the session.` (the shape `settle` gives an
+  interrupted turn's calls, so the thread stays whole). After that batch's results the
+  model is not asked again -- no further tool call, no reply -- and the transcript
+  carries one line in the harness's voice: `The person ended the session while this
+  turn was running, so the turn stops here: the tool calls already in flight finished,
+  no further call was made, and the model was not asked again.` The session loop
+  (`cli._run_interactive`) returns straight to the close-down -- the final sync, the
+  capture, `_close_down`, unchanged -- without another prompt. A mesh desk still
+  building is told at that moment rather than at the close-down: a background run's
+  budgets are zeroed (`DeskRun.abandon`) so it stops at its next command instead of
+  spending model calls for as long as the call in flight takes to come back, and the
+  session's own desk is stopped the same way, so a foreground `mesh` (`wait: true`)
+  holding the turn ends at its next lap rather than at its fifteen-minute budget. What
+  a typed line does mid-turn is otherwise exactly as #41 left it: words for the model
+  cut a wait once and ride with that batch's results; `/status` and its kind are
+  answered on the spot and cut nothing. A prompt-time `/exit` -- typed when the model is
+  waiting for input -- is unchanged. Tests drive the real loop, drain and wiring: End
+  (`/exit`, `/quit`, EOF) pressed during a held `job_check` and a held `mesh_wait` ends
+  the wait within a poll, the model is not called again, the last message carries the
+  one line, the desk's budgets are zero and the line is still in the reader; words
+  typed in the same breath as End ride with the result and the note says the person
+  left; End pressed during a `bash` lets it finish, marks the next call in the batch as
+  not run and makes no further call; the session loop returns without a second prompt;
+  `/exit` typed to an open question (partial mode) declines the call and ends the turn
+  there; a whole session through `drive` ends with the ordinary close-down and the
+  workspace put down; a prompt-time `/exit`, `/quit` and EOF are as before; a real
+  `Mesher` run told by `Loop.leave` ends at its next lap; #41's typed-words and
+  `/status` tests pass unchanged. Two warm-start tests that queued a `/exit` behind
+  their first message as the way to end afterwards now end on the reader's EOF at the
+  prompt instead: a `/exit` in the inbox at the first tool call is, correctly, the
+  person leaving. `docs/session-commands.md` says what `/exit` does mid-turn.
+- **A steady solver's residuals levelling off on an unsteady flow is no longer reported
+  to the person as a run that "did not converge".** The owner, after five solving
+  studies in three days: "In each solve I just wanted a quick look, not a mesh
+  independence study, why is it that every time it kept telling me it couldn't
+  converge??? ... Nothing converges is it?" -- and, once the transcripts were read
+  back to him: "if it's never gonna converge it doesn't mean it's physically
+  inaccurate! But the way it's phrased it's always so negative." Read with the
+  operator tool (`OpenFoam_Instance/scripts/study_log.py`), not one of the five had
+  diverged, and every mesh was checkMesh OK (max non-orthogonality 30-38, skewness
+  0.6-1.9). What happened, and what was said: (a) 20260919-041432-e0b6, a laminar
+  backward-facing step at Re_S = 800 under `simpleFoam` -- the Ux residual sat at
+  2.2e-2..3.2e-2 from iteration 250 to 30,000, on two meshes (9k, 23k cells), at
+  relaxation down to p 0.2 / U 0.4, first- and second-order, eight solver runs in all;
+  the flow is past the 2D Hopf bifurcation, so the plateau is the physics. Headline:
+  "**The headline, honestly: at Re_S = 800 there is no steady solution to converge
+  to.**"; README column "converged?" answered "no (res. floor 1.5e-2)" three times.
+  (b) 20260920-155504-4379, the "Inviscid AI" text under `simpleFoam` k-omega SST,
+  106,716 cells, Re 6.7e4, 2000 iterations in 157 s -- Ux 1.2e-2..2.0e-2, Uy
+  3.6e-2..5.1e-2, p 3.0e-2..3.9e-2 from iteration 200 to 2000, flat, no bounding; the
+  pictures were made from that field. Told: "**Honesty:** the run did **not**
+  converge -- residuals plateau at ~1e-2 ... The fields are a frozen pseudo-transient
+  snapshot ... treat them as +/-25%." (c) 20260920-161908-c7ef, the same text under
+  `pimpleFoam`, 0 -> 0.8 s in 22 min, per-step residuals Ux 5e-5 / p 4e-2 (a
+  transient's normal shape): "take Cd as +/-20-30%, not converged. One mesh, no
+  independence study", with "Mesh independence -- 3 meshes ... ~1.5 h" first among the
+  offered follow-ups; nobody had asked for one. (d) 20260921-033356-076b, `pimpleFoam`
+  at Re 6.7e3, stopped by the person at t = 1.48 s ("just plot whats there already"),
+  no bounding, Co max 2.4: the gif was delivered, then "Cd ... **Not converged and not
+  trustworthy.**", "Strouhal number: **I will not quote one.**", a figure titled "NOT
+  statistically converged". (e) 20260921-033019-e1b4, `pisoFoam` laminar at Re 200:
+  clean, one line about "no grid-refinement check". Three senses of "converge" -- a
+  steady residual, a grid, a time average -- reached the person as one message, four
+  times in five. Every diagnosis was accurate; the framing turned the physics into a
+  confession. Where it came from: the system prompt's one sentence on the subject
+  named "an unconverged solve" as the first thing to be honest about (the "Honesty:"
+  headers in (a), (b) and (c) are that sentence answered); nothing told the model what
+  a stall is, that a bluff body under a steady solver stalls by nature, or what a
+  quick look may take from a stalled field; no residual tolerance in the harness was
+  involved (none of the five cases used `case_gen.py`'s `residualControl`) and no
+  mesh-quality gate sent anything back to remeshing. The change is guidance, in the
+  places the model reads at the right moment, plus the one summariser that had the
+  negative wording built in: `openreynolds/convergence.py` holds the line -- a stall on
+  an unsteady flow or a plateau around 1e-4..1e-3 on a first look is a physically
+  meaningful field, reported as what the flow is doing with the residual in one neutral
+  clause; failure words are for a residual that climbs, a floating point exception, a
+  field the solver keeps bounding or a mesh checkMesh rejects, with what failed and what
+  would fix it; a transient window or a mesh study is offered, not started unasked --
+  with an example sentence of each kind, and the briefing carries it in every session
+  (`cli._situation_brief`). The system prompt's honesty sentence now names "a run still
+  moving when its number was read" as "a fact about it and not a verdict on the run".
+  `job_start` on a steady solver (`simpleFoam` and its kin, told by name) adds one
+  clause to the launch note: its residuals level off rather than fall on an unsteady
+  flow, and the levelled-off field is a snapshot worth showing, not a failed run.
+  `toolbox/log_digest.py` read every run that reached its end without the solver's own
+  "converged" message as "ran to the end of controlDict without reporting convergence"
+  -- the same words for a plateau on a shedding wake as for a residual climbing towards
+  an exception; it now reads the residual series (`residual_shape`: diverging, still
+  falling, levelled, or too short to say) and says which, e.g. "residuals: levelled off
+  (Ux ~1.5e-02, p ~3.0e-02) from about step 200 and stayed there -- a plateau, not a
+  divergence", against "residuals: climbing (Ux best 1.6e-05, last 1.8e+01) -- this run
+  is diverging, not converging slowly, and the last field is not one to show"; the
+  climbing/blow-up thresholds are the ones `preflight.py`'s residual gate already used,
+  now shared. No solver default changed: the runs were right. Tests pin the guidance
+  text (the failure words appear once, as the words ruled out; no imperative workflow
+  language), the briefing and launch note carrying it, and the digest's reading of a
+  steady stall, a divergence, a still-falling series and a run sitting at its floor.
+- **A held `mesh_wait` or `job_check` ends early only for words the model is about to
+  read, and says so.** The wait asked the reader's `pending()` -- is anything in the
+  queue -- while the loop's drain between tool calls (`cli._typed_while_working`) does
+  not take everything out of it: `/exit` is put back for whoever waits at the prompt,
+  an EOF likewise, and a `/status` is answered without a word reaching the model. In
+  production on 2026-09-21 (study 20260921-033019-e1b4) a put-back line sat in the
+  queue for the rest of a forty-minute turn: `mesh_wait` returned three times in nine
+  seconds -- 03:33:40 after 126 s, then 03:33:41 and 03:33:45 with `[waited 0s] [the
+  user said something, so this answered early]` -- and nothing the person had said
+  followed, because there was nothing to deliver. The model concluded the tool did not
+  wait, switched to `bash sleep 60..240` and paced the remaining thirty-seven minutes
+  with it (eighteen sleeps between 03:35 and 04:09; the eight waits it still tried,
+  four of them `job_check(wait_s=...)`, all answered in 0 s the same way). The same
+  prompt on the same model, started beside it sixteen seconds after that first cut
+  (20260921-033356-076b), held its `job_check(wait_s=120..300)` waits in full
+  throughout, and every line the person typed reached the model. The
+  question is the loop's to answer now (`Loop.heard`, wired as
+  `ToolContext.on_wait_input`): it drains the inbox the way the loop does between tool
+  calls -- commands answered on the spot, words for the model kept for this batch's
+  results -- and answers whether anything is kept. So a wait ends for a message that is
+  in the same user message as the result that ended, once (delivered, it cannot end the
+  next wait too), and a line that is nobody's to deliver to the model never ends one.
+  The result says what happened and what comes next: `[the person wrote, so this
+  answered early; their words follow this result. Answer them, then call mesh_wait again
+  -- the desk is still building]` (`job_check` says the same of the job). `job_check`
+  also decided its note by asking the question a second time after its loop, which
+  with a draining answer would have dropped the note; it remembers instead. What a
+  typed `/exit` does is unchanged: it is honoured when the turn ends, as before.
+- **`mesh_look.py --out` is relative to where you run it, like every other toolbox
+  script, and the report prints the absolute path it wrote.** A relative `--out` (and
+  `--json`) was joined to the case; `render.py`, `results.py`, `showcase.py`,
+  `geometry_view.py` and `animate.py` all read one against the working directory. In
+  production (study 20260920-161908-c7ef, 16:26:34 UTC) `cd /work/<study> && python3
+  /work/.toolbox/mesh_look.py mesh --out look.png` wrote `mesh/look.png` and printed
+  `picture: look.png`; four seconds later `read_file /work/<study>/look.png` answered
+  `not_found (404)`, and three turns went on finding the file -- for a command the
+  harness itself suggests in those words (`mesh_look.py <case> --out look.png`, in the
+  desk's result and the resume briefing). Now `--out` and `--json` resolve against the
+  working directory, the default without `--out` is still `<case>/look.png`, and the
+  `picture:` line is the absolute path. The JSON's `render` keeps its shape -- relative
+  to the case when the picture is inside it, which is what `mesher/check.py` reads and
+  joins to the case's paths -- and a `render_abs` beside it is absolute either way. The
+  mesh desk (`check.py`: `mesh_look.py . --out renders/mesh_look.png`, run in the case)
+  and the templates (`. --out look.png`, run in the case) name the case as `.`, so
+  nothing changes for them. `--help`, the script's docstring, `ENVIRONMENT.md` and the
+  toolbox `README.md` say where the file goes.
+- **The workspace listing is breadth-first, so the cap falls in the solver's bulk, not
+  on the pictures.** `Browser.tree` ran `find | head -n 4001`, and `find` walks
+  depth-first in directory order. In a transient study (20260920-161908-c7ef, in
+  production) the walk went down `run/processors4/` first and spent the whole cap on
+  per-time field files; `renders/shedding.gif`, `README.md`, `make_gif.py` and the 201
+  animation frames -- all written, looked at and described to the person -- were past
+  the cap in every listing, so the live mirror never saw them and never brought them
+  home, and the finished study's page showed `run/` and nothing else. The listing now
+  prints each entry's depth, sorts on it (stably) and strips it again before the cap:
+  every shallow entry precedes any deep one, and the cut, when there is one, lands
+  among the deepest. The cap and its notice are unchanged.
+- **The close-down of a session whose workspace has already been stopped no longer
+  starts a machine to list it.** The final sync begins with a listing (`Browser.tree`,
+  a `find` over the exec channel), and a foreground exec on a hosted workspace the
+  service had stopped lazy-starts a new one to run it. In production on 2026-09-21
+  (issue #37, item 1) an idle-timed-out session's close-down started a c7i.2xlarge at
+  02:24:32 -- the workspace had been reaped at 01:31 -- listed the files, and the
+  machine then sat until the reaper took it down again at 02:42: eighteen minutes of
+  instance for one listing. The service keeps a copy of the workspace, written at every
+  checkpoint and stop, and once the workspace is stopped it already serves `get_file`
+  and `get_tree` from it; `GET /v1/instances/{id}/files?list=1` lists it. So a
+  foreground listing is now asked as a poll first (`background=True`, which never
+  starts anything and does not count as use of the workspace); when the poll finds
+  nothing running, the listing is read from the copy (`Backend.list_stored`, which
+  `HostedBackend` answers through that route, cut to the depth asked, capped and
+  ordered as the walk's is); and the machine is started only when there is no copy
+  to read -- which is what a foreground listing always did, and is still right when
+  somebody is working. The first cut asked the study-scoped route
+  (`GET /v1/studies/{id}/workspace`) and still started a machine for a study whose
+  home is the workspace root itself -- that route refuses `/work` -- measured on
+  production the same morning (09:58 SGT, a pool adoption for one `find`); the
+  instance-scoped route has no such refusal and needs no study id. The session still
+  tells the workspace which study it serves (`Backend.study_id`, set when the study's
+  row is opened or resumed, and carried through the `PendingBackend` stand-in).
+  Unchanged: a running workspace's
+  own listing is used and the copy is never asked; the background cycles still wait
+  out a stopped workspace rather than read it every twenty seconds; a local backend,
+  and a study with no row on the platform, list exactly as before.
+
+### Changed
+
+- **Reynolds' model is GPT or Claude, and the model picks the API.** The `reynolds`
+  preset was Claude 5 over the Messages API at `{service}/v1/llm`. The service now
+  meters four models for a study, two per family: `gpt-6.1-sol` (the default) and
+  `gpt-6-astra` over the Responses API at `{service}/v1/llm/v1` (the client appends
+  `/responses`), and `claude-sonnet-5-5` and `claude-opus-5-5` over the Messages API at
+  `{service}/v1/llm` as before -- all on the service key as the model key, whatever
+  model key the config still holds. `make_provider` picks the adapter from the model,
+  not the preset (a `claude-` id is the Messages API), and each place that builds a
+  client builds it for the model it will ask: the loop, the CAD desk, its reviewer and
+  the front desk. The front desk speaks the main model's family -- `gpt-6-luna` for GPT,
+  `claude-haiku-4-5` for Claude -- and a `/model` between families on `reynolds`
+  rebuilds the client, moves the desk, and replays the thread through neutral blocks,
+  dropping the other family's reasoning. A refusal is retried on the other model of the
+  same family, never across. The window is the model's: 1,000,000 for the Claude 5.5
+  models, and 272,000 for GPT -- not those models' own, but where they start billing at
+  a long-context rate the service does not price -- so a GPT thread is compacted before
+  it gets there. The CAD desk builds with the main model. On GPT that is measured:
+  `gpt-6.1-sol`'s first corpus (`docs/cad-buildup/sweeps/core-gpt-6.1-sol-20261002-075149-9301`)
+  had 22 of 26 survive the vet, against 16 of 26 for gpt-5.6-sol. Neither Claude 5.5
+  model has been swept on the desk (Sonnet 5 finished 0 of 16 in its 30 steps). A
+  config file or a study that names `claude-sonnet-5` or `claude-opus-5` under
+  `reynolds` loads, or resumes, onto `claude-sonnet-5-5` or `claude-opus-5-5`, and any
+  other id the service does not meter onto `gpt-6.1-sol`, and says so.
+
+  The Messages adapter now sends Claude 5.5 only what it accepts. Thinking is adaptive
+  with `display: "summarized"` and the effort is sent on every turn, because Opus 5.5
+  cannot turn thinking off and defaults to `medium`; even on an endpoint that refused
+  the extras, a 5.5 model keeps its effort. The front desk's short answers ask a 5.5
+  model for `low` effort -- with `thinking: {type: "between_tools"}` on Sonnet 5.5, and
+  room for the thinking it cannot skip on Opus 5.5 -- rather than `thinking: disabled`,
+  which both refuse. No path sends a forced `tool_choice`, sampling parameters or a
+  prefill. Responses usage now counts a reported cache write as its own class, and list
+  prices for all seven models are in `llm/presets.py` (Claude's at Anthropic's list;
+  Bedrock bills at partner prices that may differ).
+
+- **The mesh desk builds in the background.** A `mesh` call used to run the desk on
+  the loop's own thread and hold it for the whole build. Measured in production
+  (study 20260920-161908-c7ef): one call held the agent for 402 s and some twenty-five
+  model calls, during which the main agent answered nothing, every line the person
+  typed was drained into the desk by its `interject` -- the same inbox the loop reads
+  between its own tool calls -- and on the web page each typed line sat marked as
+  pending until the desk consumed it, which read as "sending a message takes minutes".
+  Now `mesh` starts the desk on a daemon thread (`openreynolds/mesher/background.py`,
+  `DeskRun`) and returns at once with where it is working; the conversation carries
+  on; the desk's steps show in the transcript as before; and its end wakes the model
+  through the same watch loop a job's end does (`watch.Wake("desk")`), the person's
+  typed lines still winning. Two tools join it: `mesh_note` passes a remark to the
+  running desk, which reads it at its next command -- the desk's ears are its own now,
+  and the session's inbox is the main agent's again -- and `mesh_wait` holds for the
+  result, bounded like `job_check`'s wait and ending early when the person types. One
+  desk runs at a time; a second `mesh` call answers with where the first has got to.
+  `mesh` with `wait: true` is the old shape, whole. A `-p` run waits for a live desk
+  as it waits for a job. `session.json` records a live run, so a session resumed
+  after its process ended mid-build is told so once, with where the desk's work is.
+  All three tools are absent when the desk is not configured, as `mesh` was.
+
+## [0.3.1] - 2026-09-17
+
+### Fixed
+
+- **A session that joins a running workspace no longer leaves it up for nobody.**
+  Joining used to decide the close-down on its own: a joined session always left the
+  workspace running, so the next `openreynolds` found it still up, printed "joining
+  the workspace already running", and left it up again -- relaunching the CLI kept an
+  idle container alive (and billing) indefinitely, with no session on the web to
+  explain it. A joined session now asks the same questions as one that started the
+  workspace -- running job rows, and the probe for another session's processes -- and
+  stops it when nobody is working on it. A sibling session that is live but idle at
+  that moment starts a fresh container on its next call; the volume is untouched.
+  Studies with no directory of their own still leave a joined workspace up.
+
+## [0.3.0] - 2026-09-17
+
+### Added
+
+- **Three modes: full auto, ask before compute, structured.** `--mode`,
+  `OPENREYNOLDS_MODE`, the config file's `mode`, or `/mode <name>` mid-session
+  (`openreynolds/modes.py`). `auto` is the default and is today's behaviour byte for
+  byte: the briefing is unchanged and no tool call is ever held. `partial` puts every
+  `job_start` and `mesh` call to the person before it runs (`/yes`, `/no [reason]`,
+  `/all`), and a declined call goes back to the model as an error result carrying the
+  person's reason verbatim. `structured` offers a `checkpoint` tool that shows the
+  person a summary and what comes next and waits for their answer, and holds
+  `job_start` and `mesh` until a checkpoint has been approved since the mode began.
+  Its stage names are the guided pipeline's own phases (`toolbox/study_state.py`).
+  The question and its answer live in `openreynolds/approval.py`; the one place a call
+  is held is `Loop._consult`. A resumed study keeps its mode unless one is given.
+  `-p` with a non-auto mode is a usage error (exit `2`), because nobody is there to
+  answer.
+- **Change the model or effort mid-study.** `/model` shows the provider, model, effort,
+  mode and the models this provider is known to have; `/model <model>`,
+  `/model <provider>:<model>` and `/model <provider>` switch
+  (`openreynolds/switch.py`). A candidate is probed, image included, before it is
+  accepted, and applied only between turns. Earlier thinking blocks are dropped when
+  the model changes, and a thread too big for the new model's window (known per model
+  where it differs from the preset's, as for `claude-haiku-4-5`) is refreshed on the
+  current model first. `/effort low|medium|high` applies from the next request, and
+  `--effort` sets it at the start. The mesh desk and the front desk follow the switch.
+  A resumed study carries on on the model it was last running: `session.json` now
+  records the provider and the endpoint beside the model, and `--study <id>` restores
+  the record unless `--model` or `OPENREYNOLDS_MODEL` names a model, or this machine
+  cannot serve it -- in which case the configured model runs and the session says why.
+  Serving it means a key for the recorded provider here, switching provider if the
+  record says another one (it brings that provider's key, endpoint, window and desk
+  model with it), and on the configured provider the same endpoint as well, because a
+  gateway or router in front of one family answers to other vendors' ids and a pair
+  restored across endpoints fails a turn later with the vendor's 400. A study that
+  recorded no provider or no endpoint is refused rather than guessed at, and starts as
+  it did before. A refused restore does not rewrite the study's record: the run that
+  cannot serve the pair is the last one that should forget it, and the next resume
+  where the key is set carries on there. The record is the local `session.json`, so a
+  study resumed where it has never run starts on the configured model, and
+  `OPENREYNOLDS_PROVIDER` on its own does not hold a resume to that provider.
+- **`/help` with topics.** `/help commands`, `/help modes`, `/help model`,
+  `/help tools` and `/help keys`. Every command lives in one registry,
+  `commands.COMMANDS`, which the parser, the help text, the terminal's completion and
+  the hosted app's suggestion list are all read from.
+- **Completion in the interface.** Typing `/` in the prompt opens a list of matching
+  commands above it with a grey completion in the prompt itself; Up and Down move,
+  Tab takes the suggestion, Esc closes the list. After `/mode `, `/model `, `/effort `
+  and `/help ` the list offers that command's choices. The session bar shows model,
+  effort, provider and mode.
+- **New stream events.** `approval`, `approval_done`, `model` and `mode` on
+  `--output-format stream-json`. A question is answered by sending `/yes`, `/no ...` or
+  `/all` as an ordinary `user` line.
+- **The moving-mesh benchmarks are in the repository.** `benchmarks/moving_mesh/`
+  carries the two prompts run end to end on 2026-09-12 -- a `cyclicAMI` sliding
+  interface through a circular-Couette annulus, and a cylinder on a spring free to move
+  at Re = 100 -- and `grade.py`, which grades a rerun the same way. What was graded
+  lived outside this repository, so nobody could reproduce it. The grader reads only
+  raw solver output and never the run's own analysis, because grading those two by hand
+  found four summary numbers that disagreed with their own files and one analysis
+  script that read a torque at t = 13 and called it t = 20, having never opened the
+  restart directory. Restart directories are stitched and each cut at the start of the
+  next, columns are found by header name, and every physical constant comes off a case
+  file or the grade stops and names the flag that supplies it. Two checks are the
+  findings themselves: the interface's torque imbalance, which conservation fixes at
+  exactly zero and which the solver's own `sum(weights)` cannot see, and the VIV energy
+  audit. The known result now carries its grid convergence (three meshes per case,
+  observed order 1.93 conformal and 0.79 with the interface) and the separation that
+  matters for a rerun: at a fixed time step, four times the cells moves the interface's
+  torque error from 0.2174% to 0.2205%, so the quantity to converge is `omega*dt` and
+  not the cell count. The two nearest published amplitudes are named with the
+  parameters that differ, and A/D is still reported without a verdict.
+- **The moving-mesh field note carries those two runs.** "When the mesh moves" had been
+  written from the Wigley free-surface hull alone. It now also records the cell
+  diffusion number `nu*dt/dr^2` as what a diffusion-dominated refinement is limited by
+  (stable at 3.1 on two correctors, divergent at 6.25 and 12.5, stable to 11.5 on
+  four), that holding Courant fixed under refinement doubles it every level, that a
+  sliding interface's error is first order in the angular slide per step, that the two
+  wall torques' imbalance is a free check the `sum(weights)` health check misses
+  (0.91% against a conformal control's 0.011% on a case whose weights were perfect to
+  43 ppm), and the energy audit that moved a VIV amplitude from 0.640 to 0.567 after
+  every conventional convergence test had passed it.
+- **The mesh desk's finish check asks whether anything changed.** Asked to make a
+  channel 30 mm tall instead of 20, the desk rebuilt it, ran its own look, reported a
+  clean rebuild -- and the channel was still 20 mm, with identical bounds and an
+  identical cell count. Every clause the check had passed, because after a no-op there
+  is a valid mesh of the right rough size and nothing compared what was asked against
+  what changed.
+- **One tag publishes both registries.** `publish.yml` sends the Python package to PyPI
+  and the launcher to npm from the same tag, by trusted publishing on both sides, and
+  refuses before publishing anything if the tag, `__version__` and
+  `launcher/package.json` disagree or if the tag falls outside the launcher's
+  `PYTHON_PACKAGE_SPEC`. 0.2.0 reached PyPI while npm still shipped a launcher pinned
+  `>=0.1,<0.2`, which does not half-ship a release, it mis-ships one: every
+  `npm install -g openreynolds` keeps installing the old version and `upgrade` keeps
+  agreeing it is current. `workflow_dispatch` catches one registry up on its own.
+
+### Fixed
+
+- **A Sandbox that cycled under a read is waited out instead of failing the tool
+  call.** The hosted Sandbox goes away under load -- 9 of 68 tool calls in one live
+  study and 56 of 244 in another came back `409 sandbox_gone`, in bursts, three of the
+  four starting within 90 seconds of an 8-rank solve being launched (F-58). Nothing was
+  lost, because `/work` is a persistent Volume and a job restarts from the latest time,
+  but every one of them reached the model as a failed call and one run spent about 16
+  minutes improvising recovery and relaunched the same solve stage five times. The
+  service now answers that 409 with `Retry-After: 5`, and `FoamdClient.request` asks
+  again once for a method that only reads (a stat, a file, a listing, a job status),
+  honouring the header and capping what it can add at 15 seconds. 409 stays out of
+  `_RETRY_STATUSES`: that set is keyed on the status alone and would cover
+  `POST .../jobs` too, and a retried job start once produced five duplicate running
+  jobs. `job_start` needs an idempotency key before it can be sent twice.
+- **A file read back mid-write is no longer handed over as though it were whole.**
+  `read_file` stats the path, asks for exactly that many bytes and is given exactly
+  that many, so the short-read guard could never fire: a `postProcessing` forces file,
+  a `.dat`, a `.csv` or a log read while the solver is still appending came back
+  looking complete, and a file cut short is a number the model will happily average
+  (F-64). Pictures were covered when a half-written PNG ended two sessions; the text
+  the conclusions are drawn from was not. The path is stated a second time after the read -- one
+  round trip on a path that already makes several -- read once more if the size moved,
+  and if it is still moving the answer says so and names the three sizes rather than
+  presenting a snapshot as the file.
+- **A named model is no longer swapped for a preset's default.** A provider named on
+  its own still arrives at its preset's model, but `OPENREYNOLDS_PROVIDER=reynolds`
+  with `OPENREYNOLDS_MODEL=claude-opus-5` -- one of the two models that service meters,
+  and what the hosted app sends when someone picks Opus -- loaded as Sonnet, on new
+  sessions as well as resumes, and `/model claude-opus-5` on `reynolds` was undone the
+  same way. What was asked for is re-asserted after the preset fills its blanks
+  (`Config.load`, `switch.candidate`), for the desk model too.
+- **Piped output stops folding long lines.** `rich` folds at the width it is given,
+  however wide, so a message longer than `PIPED_WIDTH` arrived at a pipe with a newline
+  in the middle of it -- a broken path for any program or agent reading the CLI through
+  one, and the last of Windows CI's red. `soft_wrap` on the non-terminal console.
+- **`job_kill`'s docstring stops promising a `killed` status for a kill that did
+  nothing.** The service no longer marks a job killed whether or not the signal reached
+  anything (F-63): it records a real ending for a job that had already ended, and
+  refuses with `409 kill_not_delivered` for one that may still be running. Callers
+  already treated a `BackendError` as a failed kill, so only the promise changed.
+- **The dev extra installs `pyvista`.** Six toolbox tests read measurements through
+  `mesh_look.py` and got empty values back instead of a loud `ModuleNotFoundError`.
+  The symlink test also measured the fixture rather than the link, and failed on a
+  `disk.py` that was already correct (#28, #29).
+- **The README's images load, and the eighth tool is the one that exists.** All five
+  figures had been 404 since tryreynolds.com moved them into a hashed asset bundle, so
+  the repository front page, the PyPI page and the npm page had shown broken images
+  through a release of each. The eighth tool has been `mesh`, not `geometry`, since
+  2026-09-07, and `fetch` copies files out of the workspace rather than reading the
+  open web.
+- **The README says how to get in and what it costs.** Sign-in was described as email
+  and password only; an account created with Google has no password at all, and
+  `login --browser` is the way in for one. A company email address starts the account
+  with $10 of credit, once, which the CLI already printed and the README did not
+  mention. The hosted app's mesh editor and `benchmarks/moving_mesh/` are named, and
+  `doctor --json` and `studies --json` are documented where a program looks for them
+  rather than in the last clause of a table row.
+
+### Changed
+
+- **The free-will contract is amended, not dropped.** `docs/design.md` section 1, the
+  system prompt and the README's Security section now say what is true: no approvals
+  and no enforced ordering in the default mode, and exactly what the person chose to
+  have gated in the other two.
+- **`fetch` is described correctly in the README.** It copies files from the workspace
+  to your machine; the README had said it read the open web.
+
+## [0.2.0] - 2026-09-12
+
+### Added
+
+- **A fourth interface: `--output-format stream-json`.** A program can now drive a
+  session and read it as data. `openreynolds/jsonview.py` implements the whole `View`
+  protocol as NDJSON on stdout, one JSON object a line, locked and flushed per line so a
+  reader never sees half a record; `JsonReader` is the other half for anything that
+  wants to consume it in Python. `studies --json` and `doctor --json` answer the same
+  way. The seam already carried three interfaces (the terminal, the hosted app, the
+  quiet mode), so this is a fourth implementation rather than a new pathway, and
+  stdout purity is held by a test: nothing but NDJSON may reach it, which is why
+  `images.suppress()` exists (a graphics escape sequence in the middle of the stream
+  leaves a strict reader resynchronising inside a base64 blob, permanently).
+- **Trace rows carry identity.** Every tool call now records its `tool_use_id` and a
+  `result` of `{ok, bytes}`, so a transcript can be joined call-to-answer by a program
+  instead of by eye.
+- **The mesh is allowed to move.** `mesh_look.py` reports cell and face zones, the
+  motion ladder in the field notes covers `solidBodyMotion`, AMI and morphing meshes,
+  preflight carries motion rules, and a "When the mesh moves" note is drawn entirely
+  from what the free-surface Wigley run actually paid for.
+
+### Fixed
+
+- **A picture the model will not accept no longer costs the session.** Two long runs
+  died on `400 invalid_request_error: Could not process image`, both immediately after
+  the agent redrew a figure and read it back, one 27 minutes in and one 2 h 23 m in.
+  Two defects had to line up. `attachment` base64-encoded whatever it was handed, and
+  base64 of half a PNG is well-formed base64, so nothing between the disk and the API
+  could tell: `images.incomplete` now checks that a file carries the marker saying it
+  ENDED (PNG's IEND, JPEG's EOI, GIF's trailer, WebP's RIFF length) and a partial
+  render comes back as a sentence saying it is not ready. And a 400 ended the run,
+  which was right about waiting and wrong about repair, because the bad bytes sit in a
+  thread this process owns: `Loop.drop_images` replaces every image with a note and the
+  turn is retried once.
+- **A resumed session says which workspace it joined.** `acquire()` took `existing[0]`
+  from an unordered listing. With one instance per account that was not a choice; with
+  several it attaches a resume to whichever row the service returned first, and the
+  failure does not look like a wrong choice, it looks like a workspace that lost its
+  files. The listing is ordered most-recently-active first, by the same key the
+  service's own repair step uses, and the join notice says how many workspaces the
+  account holds and that `--instance` picks another.
+- **`/work` is resolved before it is compared.** It is a symlink to
+  `/__modal/volumes/vo-<id>`, and `/proc/<pid>/cwd` yields the physical path, so any
+  probe that string-matched a cwd against the literal `/work` matched nothing in
+  production. That had silently disabled the escaped-solver probe for its whole life.
+  `stopping.py` and `toolbox/disk.py` resolve the root first.
+- **A leaving session stops killing its neighbour's work.** A session that joins a
+  workspace somebody else started no longer sweeps or stops it on the way out.
+
+
 ### Added
 
 - **Two named levels: `ambition` and `consent`** (`openreynolds/levels.py`, issue #25).
@@ -60,8 +881,69 @@ All notable changes to this project are recorded here. The format follows
   change in words. It replaces the CAD-spec editor, whose spec language went with the
   toolbox that read it.
 
+### Added
+
+- `toolbox/disk.py` -- what is filling the workspace and what of it is safe to delete
+  (F-56). There is one disk: an account is capped at one instance, a new study joins the
+  existing one, and every study ever run is a sibling directory under `/work` sharing a
+  single 20 GB quota, with no retention policy and no owner. Measured 2026-09-08 at
+  30.8 GB used against that quota, with a live 24 MB study unable to write; 24.5 GB of it
+  was regenerable scratch. `report` ranks by size and says how much of each directory
+  could be produced again; `prune` removes only that and never an input, a log, a result,
+  a figure or an `Allrun`. Dry run unless `--apply`, refuses to guess which study, and
+  never deletes a whole study directory.
+- `casebundle.py` -- the case itself, captured at session end. The capture plane has
+  always carried the conversation and never the work: measured over 215 production
+  studies, the transcript is there for essentially all of them, an artifact for 40%, a
+  results payload for 12%, and the case definition, mesh and solver logs for **none**. So
+  every mesh and every `Allrun` this product has made lived in exactly one place, on that
+  shared disk. The bundle is built from the local mirror (no extra network) in tiers,
+  irreplaceable first -- definition, record, notes, geometry, then mesh and latest fields,
+  which a resume can rebuild and re-solve. `definition + record` is about 4 MB a study, so
+  the part that cannot be reproduced always fits. Nothing is dropped silently: the report
+  and the `MANIFEST.json` inside the archive both name what was left out and why.
+- `toolbox/cfmesh.py` -- cfMesh reachable from the toolbox, with the four traps that each
+  cost a round encoded so they cannot be walked into (F-53). snappy's layer coverage
+  erodes 88.6% -> 66.7% over fifty iterations on a thin hull while cfMesh covers 100% of
+  the same wall at its defaults, and cfMesh has been prebuilt in the image all along.
+  What it costs is stated rather than glossed: no y+ control.
+- `toolbox/reattach.py` and `toolbox/claims.py` -- one blessed reattachment implementation,
+  and the number a figure was drawn from stamped into the figure (F-36). A study once
+  delivered a figure annotated 7.57 beside an answer that said 6.4 and reconciled neither.
+
 ### Fixed
 
+- A redirect on a request carrying a body is no longer followed blind (F-47). httpx
+  re-issues a 301/302/303 on a POST as a **GET with no body**, so the blanket
+  `follow_redirects=True` added for F-45 made any redirect on an upload a body-losing
+  event. 307/308 and bodyless requests are followed; a 303 is followed and *remembered*,
+  so a 4xx collected through a hop the body did not travel on is treated as ambiguous
+  rather than as a fact about the request; 301/302 on a body-carrying request are refused
+  and named. And `put_tree` still holds the archive it built, so on a `400 not a valid
+  tar.gz archive` it opens those bytes and, if they are a readable gzipped tar, says so:
+  the bytes that arrived are not the bytes that were sent. The message used to point at
+  the wrong party, and the wrong party is the only one that can prove it.
+- `describe_job` no longer labels every `killed_by` "matched kill_on line". That was right
+  while a `kill_on` regex was the only writer; foamd now writes the field on every
+  terminal state that is a kill, and only one of six producers is a log line. The old
+  label would have told the model a vanished container was a regex match.
+- A session no longer stops a workspace with somebody else's work still running on it
+  (F-46). Teardown asked only whether another session had the instance up when this one
+  joined it, which is the wrong question about a detached job: jobs outlive sessions by
+  design, and a job started outside any session leaves no flag anywhere, so the next
+  session to start the instance also owned it and stopped it on the way out. A detached
+  rendering job died that way with six of its eight steps done and its two animation
+  passes holding empty output directories. `Backend.active_jobs()` asks the service what
+  is actually running -- one read of the job rows, which starts no container -- and the
+  workspace is left up, and named, when anything is. A listing that fails answers
+  "nothing" and says so, because a workspace left up on an unanswerable question bills
+  until a reaper notices.
+- The capture warning says what it lost (F-44). `capture dropped 1 item(s)` reported a
+  count and nothing else, and the only question a person has on reading it is *what*: a
+  dropped message leaves a gap in the transcript on the web, a dropped artifact leaves a
+  picture that exists on the laptop and nowhere else. Up to six items are now named
+  (`artifact mesh_z.png`, `message seq 41 (assistant)`); past that the kinds are counted
+  and the first is named, because the middle of a long outage is not readable.
 - A word in a comment is no longer a finish. The mesh desk's `MESH_DONE` was matched
   anywhere in a bash block, and the brief hands the desk that token -- so a step whose
   comment said `# will echo MESH_DONE once checkMesh passes` had its actual command
@@ -389,5 +1271,12 @@ on 2026-08-24:
 - A duplicate copy of the architecture notes at the repository root is gone; the one
   under the toolbox notes is the one that ships.
 
-[Unreleased]: https://github.com/InviscidAI/OpenReynolds/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/InviscidAI/OpenReynolds/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/InviscidAI/OpenReynolds/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/InviscidAI/OpenReynolds/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/InviscidAI/OpenReynolds/compare/v0.3.2...v0.4.0
+[0.3.2]: https://github.com/InviscidAI/OpenReynolds/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/InviscidAI/OpenReynolds/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/InviscidAI/OpenReynolds/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/InviscidAI/OpenReynolds/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/InviscidAI/OpenReynolds/releases/tag/v0.1.0
