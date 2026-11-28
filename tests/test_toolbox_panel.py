@@ -1025,3 +1025,10 @@ def test_an_aerofoil_is_still_required_without_the_check(panel):
                           capture_output=True, text=True, timeout=300)
     assert done.returncode != 0
     assert "--naca" in done.stderr and "--check" in done.stderr
+
+
+@pytest.mark.parametrize("designation", ["2412", "naca2412", "NACA 2412", "Naca2412", "NACA-2412"])
+def test_a_naca_designation_is_read_whatever_its_prefix_is_spelled(panel, designation):
+    """#291: `lstrip("naca")` strips a character set, so "Naca2412" was refused."""
+    nodes, _ = panel.naca4(designation, 160)
+    assert np.allclose(nodes, panel.naca4("2412", 160)[0])

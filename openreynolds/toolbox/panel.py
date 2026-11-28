@@ -82,7 +82,7 @@ def naca4(designation: str, n_panels: int = 160) -> tuple[np.ndarray, dict]:
     Cosine spacing in x, so panels cluster where the curvature is: the nose, where a
     uniform distribution puts the stagnation point several percent of chord out.
     """
-    digits = designation.strip().lstrip("naca").lstrip("NACA").strip()
+    digits = re.sub(r"^\s*naca[\s_-]*", "", designation, flags=re.I).strip()
     if not (len(digits) == 4 and digits.isdigit()):
         raise Unusable(f"a NACA 4-digit designation is four digits; got {designation!r}")
     m = int(digits[0]) / 100.0
