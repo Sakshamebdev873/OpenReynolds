@@ -2186,7 +2186,7 @@ def run_sph_static_float(*, particle_radius: float = 0.002, beam: float = 0.064,
     # failed "the tank was at rest before sampling" on the defaults while every force
     # number in it improved. Scale the count by the step ratio so the budget is a time and
     # not a number of iterations.
-    budget = int(round(settle_steps * (sph.CFL / max(world.cfl, 1e-9))))
+    budget = int(round(settle_steps * (_sph().CFL / max(world.cfl, 1e-9))))
     settled = _settle(world, reference_speed=celerity, max_steps=budget,
                       # **Settle the FLUID only, with Newton not stepping at all.**
                       # The pin used to be `step=link.step, hold=hold`: step the
@@ -2443,7 +2443,7 @@ def run_sph_heave_decay(*, particle_radius: float = 0.002, beam: float = 0.064,
     # failed "the tank was at rest before sampling" on the defaults while every force
     # number in it improved. Scale the count by the step ratio so the budget is a time and
     # not a number of iterations.
-    budget = int(round(settle_steps * (sph.CFL / max(world.cfl, 1e-9))))
+    budget = int(round(settle_steps * (_sph().CFL / max(world.cfl, 1e-9))))
     settled = _settle(world, reference_speed=celerity, max_steps=budget,
                       # **Settle the FLUID only, with Newton not stepping at all.**
                       # The pin used to be `step=link.step, hold=hold`: step the
@@ -2836,7 +2836,7 @@ def _heel_once(box: _Box, *, particle_radius: float, depth: float, span: float,
     # failed "the tank was at rest before sampling" on the defaults while every force
     # number in it improved. Scale the count by the step ratio so the budget is a time and
     # not a number of iterations.
-    budget = int(round(settle_steps * (sph.CFL / max(world.cfl, 1e-9))))
+    budget = int(round(settle_steps * (_sph().CFL / max(world.cfl, 1e-9))))
     settled = _settle(world, reference_speed=celerity, max_steps=budget,
                       # **Settle the FLUID only, with Newton not stepping at all.**
                       # The pin used to be `step=link.step, hold=hold`: step the
@@ -2988,7 +2988,7 @@ def run_sph_force_noise(*, particle_radius: float = 0.002, side: float = 0.032,
     # failed "the tank was at rest before sampling" on the defaults while every force
     # number in it improved. Scale the count by the step ratio so the budget is a time and
     # not a number of iterations.
-    budget = int(round(settle_steps * (sph.CFL / max(world.cfl, 1e-9))))
+    budget = int(round(settle_steps * (_sph().CFL / max(world.cfl, 1e-9))))
     settled = _settle(world, reference_speed=celerity, max_steps=budget,
                       # **Settle the FLUID only, with Newton not stepping at all.**
                       # The pin used to be `step=link.step, hold=hold`: step the
